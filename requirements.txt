@@ -1,0 +1,16 @@
+pandas
+numpy
+mysql-connector-python
+elasticsearch==8.11.0
+ipfshttpclient
+web3
+transformers
+torch
+stable-baselines3[extra]
+gymnasium
+python-dotenv
+psutil
+Faker
+scikit-learn
+optimum-intel
+optimum-intel[openvino]
