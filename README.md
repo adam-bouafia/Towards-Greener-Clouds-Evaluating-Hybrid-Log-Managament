@@ -237,9 +237,94 @@ Run tests with:
 pytest -q
 ```
 
-## 🔬 Two-Phase Experiment (Learning Agents)
+## 🔬 Unified Six-Router Experiment Orchestrator
 
-(Description unchanged; CBR operates online and does not require a separate training phase.)
+A single command now prepares (training if needed) and evaluates the six comparative routers:
+
+`a2c`, `cbr`, `q_learning`, `direct_mysql`, `direct_elk`, `direct_ipfs`
+
+The legacy `static` policy is retained only as an internal fallback inside adaptive routers and is no longer part of the headline comparisons.
+
+### Why a Unified Orchestrator?
+
+Previously you had to (1) train Q-learning, (2) train A2C, and (3) run separate evaluation invocations. The new orchestrator (`src/experiment.py`) automates this flow, ensuring consistent dataset sampling, metric collection, and aggregated reporting (latency distribution, success rate, destination mix, energy).
+
+### Command Example
+
+```bash
+python -m src.experiment \
+  --log_filepath data/Loghub-zenodo_Logs.csv \
+  --sample_mode head \
+  --q_episodes 120 \
+  --a2c_timesteps 120000 \
+  --routers all \
+  --cbr_cost_metric combined \
+  --output_dir results \
+  --write_markdown
+```
+
+What happens:
+ 
+1. Checks for Q-learning artifacts (`trained_models/q_learning_*`). Trains if missing or `--force_retrain` supplied.
+2. Checks for A2C artifacts (`trained_models/a2c_log_router.zip`, metadata). Trains if missing or forced.
+3. Runs evaluation for each selected router (default `all` → six routers). CBR always starts cold (online learner by design). RL agents are frozen (no learning during evaluation phase).
+4. Produces per-router CSVs (already implemented in `__main__.py`).
+5. Aggregates all per-log CSVs into `combined_summary_<dataset>.csv` (+ optional markdown table) with:
+   - mean / median / p95 total latency
+   - success rate
+   - sensitive log fraction
+   - destination mix (mysql / elk / ipfs)
+   - average energy per log (J)
+6. Writes `experiment_metadata_<dataset>.json` capturing training reuse, durations, and statuses.
+
+### Key Orchestrator Flags
+
+| Flag | Purpose | Default |
+|------|---------|---------|
+| `--log_filepath` | Real-world log CSV path | (required) |
+| `--sample_mode` | Log sampling mode (`head`,`random`,`balanced`) | head |
+| `--routers` | Comma list or `all` | all |
+| `--q_episodes` | Q-learning training episodes | 120 |
+| `--q_prefix` | Q-learning artifact prefix (under `trained_models/`) | q_learning |
+| `--a2c_timesteps` | A2C training timesteps | 120000 |
+| `--a2c_base` | A2C base model name (under `trained_models/`) | a2c_log_router |
+| `--a2c_scaler_warmup` | A2C scaler warmup obs (0 disables) | 0 |
+| `--a2c_lr_linear_decay` | Enable linear LR decay | off |
+| `--a2c_ent_anneal` | Enable entropy anneal (requires target + steps) | off |
+| `--a2c_ent_target` | Target entropy coef (with anneal) | None |
+| `--a2c_ent_steps` | Anneal steps | None |
+| `--cbr_cost_metric` | CBR cost focus (`latency`,`energy`,`combined`) | combined |
+| `--cbr_state_path` | Optional persistent CBR state JSON | None |
+| `--force_retrain` | Retrain RL even if artifacts present | off |
+| `--seed` | RNG seed (passed to A2C) | None |
+| `--output_dir` | Directory for combined outputs | results |
+| `--write_markdown` | Emit Markdown summary table | off |
+
+### Fairness & Interpretation
+
+- Q-learning & A2C are trained offline and evaluated frozen.
+- CBR adapts online during the evaluation stream (that *is* the method).
+- Direct baselines give lower/upper reference bounds for each individual backend.
+- Energy values rely on RAPL; on unsupported hardware they may read near zero—still comparable across routers.
+- `sample_mode` should be kept constant across runs to avoid distribution-induced bias.
+
+### Outputs
+
+| File | Description |
+|------|-------------|
+| `results/<router>_<dataset>.csv` | Per-log trace (existing behavior) |
+| `results/summary_<router>_<dataset>.csv` | Per-router summary (existing) |
+| `results/combined_summary_<dataset>.csv` | Cross-router aggregate metrics |
+| `results/combined_summary_<dataset>.md` | (Optional) Markdown table |
+| `results/experiment_metadata_<dataset>.json` | Run metadata (timings, training reused status) |
+
+### Extending
+
+Add new router names to `DEFAULT_ROUTERS` in `src/experiment.py` and ensure `__main__.py` can build them. The aggregator will pick up any additional per-log CSV automatically if included in `--routers`.
+
+---
+
+The sections below (training artifacts) remain for detailed reference.
 
 ### Q-learning Artifacts & Compatibility
 
