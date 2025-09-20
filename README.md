@@ -2,9 +2,27 @@
 
 A research implementation of an intelligent, energy-aware log routing system. This system dynamically routes log entries to one of three specialized storage tiers (MySQL, ELK, IPFS) based on Intelligent Routing balancing performance, analytical capability, and cryptographic integrity.
 
+## 🆕 New: Content-Based Routing (CBR)
+
+The project now includes an adaptive **Content-Based Router (CBR)** inspired by Bizarro et al. (VLDB'05). Unlike the hand-crafted static rules (previous "static" baseline), CBR:
+
+- Learns online which log attributes (e.g., `Level`, `Component`, `LogSource`) correlate with backend cost (latency / energy).
+- Hash-partitions attribute values into buckets and keeps per-backend cost statistics per bucket.
+- Periodically scores attributes using a variance-reduction heuristic (proxy for gain) and picks the highest scoring attribute as its current classifier.
+- Routes each log to the backend with the lowest expected cost for that bucket.
+- Falls back gracefully to global averages, then to the original static policy when insufficient data is available.
+
+Supported cost metrics (`--cbr_cost_metric`):
+
+- `latency` (default)
+- `energy` (uses per-log CPU package Joules when available)
+- `combined` (simple weighted sum: latency_ms + 1000 * energy_j)
+
+Optional JSON diagnostics: set `--cbr_json_dump_path path/to/cbr_diag.json --cbr_json_dump_interval 500` to periodically dump internal state (attribute scores, selected classifier, sample counts).
+
 ## 📁 Repository Structure
 
-```
+```text
 hybrid-log-management/
 ├── data/                           # Input log datasets
 │   ├── Loghub-zenodo_Logs.csv      # Real-world logs from Loghub 2.0 (~14k entries)
@@ -22,16 +40,13 @@ hybrid-log-management/
 │   ├── log_provider.py             # Reads and samples from log datasets
 │   ├── __main__.py                 # Main application entry point
 │   ├── metrics.py                  # Energy and performance measurement (RAPL)
-│   ├── routers.py                  # Implements Static, Q-learning, and A2C routers
+│   ├── routers.py                  # Static, CBR, Q-learning, A2C, direct baselines
 │   ├── train.py                    # Script to train the A2C model
 │   └── train_qlearning.py          # Script to train the Q-learning agent
 ├── tables/                         # Processed data tables for the thesis
+├── tests/                          # Automated tests (CBR unit tests etc.)
 ├── test_ipfs.py                    # Utility script to test IPFS connection
 └── trained_models/                 # Persisted models from the training phase
-    ├── a2c_Loghub-zenodo_Logs.zip  # Trained A2C model checkpoint
-    ├── q_learning_binner.pkl       # Q-learning's discretization model
-    ├── q_learning_pca.pkl          # Q-learning's PCA model
-    └── q_learning_q_table.pkl      # Q-learning's Q-table
 ```
 
 ## 🎯 Key Features
@@ -40,82 +55,112 @@ hybrid-log-management/
   - **Performance (MySQL):** High-throughput, low-latency storage for routine operational logs.
   - **Analytics (ELK Stack):** Powerful search and aggregation for debugging and metrics.
   - **Integrity (IPFS):** Immutable, tamper-evident storage for security-critical audit trails.
-- **Intelligent Routing:** Evaluates three routing strategies:
-  - **Static Policy:** Rule-based routing (Content-Based Routing).
-  - **Q-learning:** Tabular Reinforcement Learning agent.
-  - **A2C (Advantage Actor-Critic):** Deep Reinforcement Learning agent.
-- **Semantic Log Understanding:** Uses a pre-trained **DistilBERT** model to generate embeddings from log text, enabling content-aware routing decisions.
-- **Energy-Aware Evaluation:** Measures CPU energy consumption using Intel's RAPL interface and estimates carbon emissions.
-- **Full Reproducibility:** Containerized backends, pinned versions, and a frozen evaluation phase ensure all results are reproducible.
+- **Adaptive Routing Strategies:**
+  - **Static Policy (Rules):** Deterministic baseline using log severity/content heuristics.
+  - **CBR (Content-Based Routing):** Online adaptive attribute-based cost minimization (no offline training).
+  - **Q-learning:** Tabular RL with PCA + discretization and a teacher-guided exploration.
+  - **A2C:** Deep RL using Stable-Baselines3.
+  - **Direct Baselines:** Always route to a single backend (`direct_mysql`, etc.).
+- **Semantic Log Understanding:** DistilBERT embeddings of log content.
+- **Energy-Aware Evaluation:** RAPL CPU package Joules → Wh/log + CO₂ estimation.
+- **Diagnostics & Explainability:** Optional JSON dumps for CBR; per-log CSV traces; attribute scoring.
 
 ## ⚙️ Prerequisites
 
-- **Docker & Docker Compose:** Required to run the storage backends.
-- **Python 3.9+**
-- **Bash Shell** (to run `run_all.sh`)
-- An Intel CPU (required for accurate energy measurement via RAPL)
+- Docker & Docker Compose
+- Python 3.9+
+- Intel CPU (for accurate RAPL measurements; otherwise energy will register as zero)
 
 ## 🚀 Quick Start
 
-1. **Clone the repository and navigate into it:**
-   ```bash
-   git clone https://github.com/adam-bouafia/Towards-Greener-Clouds-Evaluating-Hybrid-Log-Managament
-   cd hybrid-log-management
-   ```
+```bash
+git clone https://github.com/adam-bouafia/Towards-Greener-Clouds-Evaluating-Hybrid-Log-Managament
+cd hybrid-log-management
+pip install -r requirements.txt
+docker-compose up -d
+```
 
-2. **Install Python dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+Run an experiment with CBR (real dataset example):
 
-3. **Start the backend services (MySQL, Elasticsearch, Kibana, IPFS):**
-   ```bash
-   docker-compose up -d
-   ```
-   *Wait a few minutes for Elasticsearch to fully start. Check logs with `docker-compose logs elasticsearch`.*
+```bash
+python -m src --router cbr \
+  --log_source real_world \
+  --log_filepath data/Loghub-zenodo_Logs.csv \
+  --cbr_cost_metric combined \
+  --cbr_num_buckets 32 \
+  --cbr_sample_prob 0.08 \
+  --cbr_warm_samples 120 \
+  --cbr_json_dump_path results/cbr_diag.json \
+  --cbr_json_dump_interval 500
+```
 
-4. **Run the complete experiment pipeline:**  
-   This script runs the two-phase experiment (training followed by frozen evaluation) for all routers and both datasets.
-   ```bash
-   ./run_all.sh
-   ```
+Switch to A2C for comparison:
 
-5. **Analyze the results:**
-   - **Raw Data:** See CSV files in the `results/` directory.
-   - **Plots & Figures:** Run the `plots.ipynb` Jupyter notebook to regenerate all graphs saved in the `figures/` folder.
-   - **Aggregate Tables:** The `tables/` directory contains aggregated results for the thesis.
+```bash
+python -m src --router a2c --model_path trained_models/a2c_log_router --log_source real_world --log_filepath data/Loghub-zenodo_Logs.csv
+```
 
-## 🔬 The Two-Phase Experiment
+## 🔧 CBR Parameters
 
-The experiment is designed to ensure a fair, reproducible comparison between routing strategies.
+| Flag | Purpose | Default |
+|------|---------|---------|
+| `--cbr_num_buckets` | Hash buckets per attribute | 24 |
+| `--cbr_sample_prob` | Probability of sampling a log for stats | 0.06 |
+| `--cbr_warm_samples` | Samples required before first attribute selection | 150 |
+| `--cbr_recompute_interval` | Decisions between rescoring | 200 |
+| `--cbr_cost_metric` | `latency`, `energy`, or `combined` | latency |
+| `--cbr_latency_weight` | Weight for latency in combined cost | 1.0 |
+| `--cbr_energy_weight` | Weight for energy (J) in combined cost | 1000.0 |
+| `--cbr_json_dump_path` | Optional path to JSON diagnostics | None |
+| `--cbr_json_dump_interval` | Dump frequency (decisions) | 0 (disabled) |
+| `--cbr_json_dump_mode` | JSON writing mode: overwrite / append / timestamp | overwrite |
+| `--cbr_state_path` | Persist / load CBR learned stats JSON | None |
 
-1. **Phase 1: Training**
-   - **Goal:** Train the learning-based models (Q-learning, A2C) and create all necessary artifacts.
-   - **Process:** The agents interact with the environment, learning a routing policy based on a reward signal that balances latency, energy, and integrity.
-   - **Output:** Frozen model files (`.pkl` for Q-learning, `.zip` for A2C) are saved to the `trained_models/` directory. The Static router requires no training.
 
-2. **Phase 2: Frozen Evaluation**
-   - **Goal:** Compare all routers on an *identical* sequence of log entries.
-   - **Process:** The pre-trained models are loaded. Each log from the dataset is processed by every router in a deterministic manner, and key metrics (latency, energy, success) are meticulously measured.
-   - **Output:** Detailed per-log and aggregate results in the `results/` directory. This phase guarantees that performance differences are due to the algorithms' effectiveness, not random variation or data leakage.
+### JSON Dump Modes
 
- 
+- `overwrite`: Replace file each interval with latest snapshot.
+- `append`: Write one JSON object per line (NDJSON stream).
+- `timestamp`: Emit separate file per dump (suffix epoch seconds).
 
-## 📊 Results
+### State Persistence
 
-The `figures/` directory contains the key findings from the thesis, comparing the routers across:
+If `--cbr_state_path` is provided, CBR will attempt to load prior statistics at startup and save updated state on exit, enabling faster adaptation across repeated runs.
 
-- Latency vs. Throughput trade-offs
-- Energy efficiency (Wh per log)
-- Scaling behavior under load (14k vs. 200k logs)
-- Tail latency (90th, 95th, 99th percentiles)
-- Destination selection patterns (adaptivity)
+## 🧪 Tests
 
- 
+Basic unit tests for CBR are located in `tests/test_cbr_router.py` covering:
+
+- Fallback behavior prior to warm-up.
+- Attribute selection after sufficient samples.
+- JSON diagnostic dump creation.
+
+Run tests with:
+
+```bash
+pytest -q
+```
+
+## 🔬 Two-Phase Experiment (Learning Agents)
+
+(Description unchanged; CBR operates online and does not require a separate training phase.)
+
+## 📊 Results & Plots
+
+See `results/` and `figures/` as before; adding CBR will generate `cbr_<dataset>.csv` and `summary_cbr_<dataset>.csv`.
+
+## 🔍 Future Improvements
+
+- Enhanced cost modeling (include variance, success penalties).
+- Persistence of CBR learned stats across runs.
+- Dynamic bucket refinement for high-cardinality attributes.
+- Unified evaluation harness for energy-normalized comparisons.
+
 ## 👤 Author
 
 **Adam Bouafia**  
-[LinkedIn](hhttps://www.linkedin.com/in/adam-bouafia-b597ab86/)  
+[LinkedIn](hhttps://www.linkedin.com/in/adam-bouafia-b597ab86/)
+
 ---
 
-**Note:** This is a research prototype. Absolute performance numbers will vary based on hardware. The relative comparisons and trade-offs between the strategies are the key findings.
+*Research prototype: absolute metrics vary by host; comparative behavior is the key insight.*

@@ -11,7 +11,7 @@ from .backends import BackendManager
 from .config import MYSQL_DATABASE, MYSQL_ROOT_PASSWORD
 from .log_provider import LogProvider
 from .metrics import EnergyMeter
-from .routers import StaticRouter, QLearningRouter, A2CRouter, DirectRouter
+from .routers import StaticRouter, QLearningRouter, A2CRouter, DirectRouter, CBRRouter
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -46,7 +46,7 @@ def _normalize_model_base(p: str | None) -> str:
     return s
 
 
-def _build_router(name: str, model_path: str):
+def _build_router(name: str, model_path: str, **kwargs):
     if name == "static":
         return StaticRouter()
     if name == "q_learning":
@@ -56,6 +56,8 @@ def _build_router(name: str, model_path: str):
         if not os.path.isabs(base):
             base = os.path.join(PROJECT_ROOT, base)
         return A2CRouter(base)
+    if name == "cbr":
+        return CBRRouter(**kwargs)
 
     # direct modes:
     if name == "direct_mysql":
@@ -74,7 +76,7 @@ def main():
         "--router",
         type=str,
         required=True,
-        choices=["static", "q_learning", "a2c", "direct_mysql", "direct_elk", "direct_ipfs"],
+        choices=["static", "q_learning", "a2c", "cbr", "direct_mysql", "direct_elk", "direct_ipfs"],
         help="Routing algorithm to use",
     )
     parser.add_argument("--sample_mode", type=str, default="head",
@@ -93,6 +95,17 @@ def main():
         default=float(os.environ.get("EMISSIONS_KG_PER_KWH", "0.233")),  # EU-ish average
         help="Carbon intensity used for summary emissions computation",
     )
+    parser.add_argument("--cbr_num_buckets", type=int, default=24, help="CBR: number of hash buckets per attribute")
+    parser.add_argument("--cbr_sample_prob", type=float, default=0.06, help="CBR: probability of sampling a log for stats")
+    parser.add_argument("--cbr_warm_samples", type=int, default=150, help="CBR: samples required before attribute selection")
+    parser.add_argument("--cbr_recompute_interval", type=int, default=200, help="CBR: decisions between attribute rescoring")
+    parser.add_argument("--cbr_cost_metric", choices=["latency", "energy", "combined"], default="latency", help="CBR: cost metric")
+    parser.add_argument("--cbr_json_dump_path", type=str, default=None, help="CBR: path to write periodic JSON diagnostic snapshot")
+    parser.add_argument("--cbr_json_dump_interval", type=int, default=0, help="CBR: dump interval in decisions (0 disables)")
+    parser.add_argument("--cbr_latency_weight", type=float, default=1.0, help="CBR: latency weight for combined cost")
+    parser.add_argument("--cbr_energy_weight", type=float, default=1000.0, help="CBR: energy weight for combined cost")
+    parser.add_argument("--cbr_json_dump_mode", choices=["overwrite", "append", "timestamp"], default="overwrite", help="CBR: JSON dump writing mode")
+    parser.add_argument("--cbr_state_path", type=str, default=None, help="CBR: path to persist learned stats between runs")
     args = parser.parse_args()
 
     dataset_name = os.path.splitext(os.path.basename(args.log_filepath or ""))[0] or args.log_source
@@ -100,7 +113,21 @@ def main():
     backend_manager = BackendManager(
         type("Config", (object,), {"MYSQL_ROOT_PASSWORD": MYSQL_ROOT_PASSWORD, "MYSQL_DATABASE": MYSQL_DATABASE})()
     )
-    router = _build_router(args.router, args.model_path)
+    cbr_kwargs = dict(
+        num_buckets=args.cbr_num_buckets,
+        sample_prob=args.cbr_sample_prob,
+        warm_samples=args.cbr_warm_samples,
+        recompute_interval=args.cbr_recompute_interval,
+        cost_metric=args.cbr_cost_metric,
+        json_dump_path=args.cbr_json_dump_path,
+        json_dump_interval=args.cbr_json_dump_interval,
+        latency_weight=args.cbr_latency_weight,
+        energy_weight=args.cbr_energy_weight,
+        json_dump_mode=args.cbr_json_dump_mode,
+        state_path=args.cbr_state_path,
+    ) if args.router == "cbr" else {}
+
+    router = _build_router(args.router, args.model_path, **cbr_kwargs)
     meter = EnergyMeter()
     proc = psutil.Process(os.getpid())
 
@@ -164,6 +191,19 @@ def main():
                 print(f"Error writing to backend {destination}: {ex}")
                 success = False
                 backend_write_latency_ms = 1000.0
+
+            # feedback hook for adaptive routers
+            try:
+                router.observe(
+                    log_entry=log_entry,
+                    destination=destination,
+                    success=success,
+                    routing_latency_ms=routing_latency_ms,
+                    backend_latency_ms=backend_write_latency_ms,
+                    energy_cpu_pkg_j=energy_cpu_pkg_j,
+                )
+            except Exception as _obs_ex:
+                print(f"[ROUTER_OBSERVE] {type(_obs_ex).__name__}: {_obs_ex}")
 
             total_latency_ms = routing_latency_ms + backend_write_latency_ms
             latencies_total.append(total_latency_ms)
@@ -259,6 +299,12 @@ def main():
     print(f"Summary saved to {summary_path}")
 
     backend_manager.close_connections()
+
+    if args.router == "cbr":
+        try:
+            router.save_state()
+        except Exception as e:
+            print(f"[CBR] Failed to save state at shutdown: {e}")
 
 
 if __name__ == "__main__":

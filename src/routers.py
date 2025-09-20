@@ -4,6 +4,9 @@ from __future__ import annotations
 import math
 import pickle
 from abc import ABC, abstractmethod
+from collections import defaultdict
+import random
+import time
 
 import numpy as np
 from stable_baselines3 import A2C
@@ -26,6 +29,11 @@ class BaseRouter(ABC):
     def get_route(self, log_entry: dict) -> str:
         """Return one of: 'mysql', 'elk', 'ipfs'."""
         raise NotImplementedError
+
+    def observe(self, *, log_entry: dict, destination: str, success: bool,
+                routing_latency_ms: float, backend_latency_ms: float,
+                energy_cpu_pkg_j: float | None = None):
+        return None
 
 
 class StaticRouter(BaseRouter):
@@ -135,3 +143,252 @@ class DirectRouter(BaseRouter):
 
     def get_route(self, log_entry: dict) -> str:
         return self.destination
+
+# -------------- Content-Based Routing (CBR) --------------
+class CBRRouter(BaseRouter):
+    """Adaptive content-based router (inspired by Bizarro et al. VLDB'05).
+
+    Simplified adaptation for log routing:
+      * Treat candidate log fields as attributes (e.g., Level, Component, LogSource, first token of Content).
+      * For each attribute we maintain per-bucket statistics of backend latency (and drop/success proxy).
+      * Periodically (every `recompute_interval` decisions) we score attributes to pick a classifier attribute.
+      * Routing decision for a log chooses backend with lowest expected latency for that attribute bucket.
+
+    Notes:
+      - We approximate selectivity with average backend latency (lower is "drop earlier").
+      - Bucketing: hash(attribute_value) mod `num_buckets`.
+      - Fallback order: use global backend latency averages; if none, default to StaticRouter.
+    """
+    def __init__(self, *, num_buckets: int = 24, sample_prob: float = 0.06,
+                 warm_samples: int = 150, recompute_interval: int = 200,
+                 cost_metric: str = "latency", json_dump_path: str | None = None,
+                 json_dump_interval: int = 0, latency_weight: float = 1.0,
+                 energy_weight: float = 1000.0, json_dump_mode: str = "overwrite",
+                 state_path: str | None = None):
+        self.num_buckets = int(num_buckets)
+        self.sample_prob = float(sample_prob)
+        self.warm_samples = int(warm_samples)
+        self.recompute_interval = int(recompute_interval)
+        self.cost_metric = cost_metric  # latency | energy | combined
+        self.json_dump_path = json_dump_path
+        self.json_dump_interval = int(json_dump_interval)
+        self.latency_weight = float(latency_weight)
+        self.energy_weight = float(energy_weight)
+        self.json_dump_mode = json_dump_mode  # overwrite | append | timestamp
+        self.state_path = state_path
+
+        self.candidate_attributes = ["Level", "Component", "LogSource"]
+        self.static = StaticRouter()
+        # stats[attribute][bucket][backend] -> list of latencies
+        self.stats = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        # global_stats[backend] -> list of latencies
+        self.global_stats = defaultdict(list)
+
+        self.samples_collected = 0
+        self.decisions = 0
+        self.classifier_attr: str | None = None
+        self.attr_scores: dict[str, float] = {}
+        self.backend_order = ["mysql", "elk", "ipfs"]
+
+        # Cache of per attribute bucket -> expected latency per backend
+        self.expected_latency = defaultdict(lambda: defaultdict(lambda: float('inf')))
+
+        self._load_state_if_any()
+
+    def _load_state_if_any(self):
+        if not self.state_path:
+            return
+        import os, json
+        if not os.path.isfile(self.state_path):
+            return
+        try:
+            with open(self.state_path, 'r') as f:
+                data = json.load(f)
+            # reconstruct stats
+            stats_in = data.get('stats', {})
+            for attr, buckets in stats_in.items():
+                for b_str, backends in buckets.items():
+                    b = int(b_str)
+                    for backend, lst in backends.items():
+                        self.stats[attr][b][backend].extend(lst)
+            global_in = data.get('global_stats', {})
+            for backend, lst in global_in.items():
+                self.global_stats[backend].extend(lst)
+            self.samples_collected = int(data.get('samples_collected', 0))
+            self.decisions = int(data.get('decisions', 0))
+            self.classifier_attr = data.get('classifier_attr')
+            self.attr_scores = data.get('attr_scores', {})
+            self._compute_expected()
+            print(f"[CBR] Loaded persisted state from {self.state_path}")
+        except Exception as e:
+            print(f"[CBR] Failed to load state ({e})")
+
+    def save_state(self):
+        if not self.state_path:
+            return
+        import json, os
+        try:
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            # convert stats to pure python for JSON
+            stats_out = {}
+            for attr, buckets in self.stats.items():
+                stats_out[attr] = {}
+                for b, backend_lat in buckets.items():
+                    stats_out[attr][str(b)] = {backend: lst for backend, lst in backend_lat.items()}
+            data = {
+                'num_buckets': self.num_buckets,
+                'stats': stats_out,
+                'global_stats': {k: v for k, v in self.global_stats.items()},
+                'samples_collected': self.samples_collected,
+                'decisions': self.decisions,
+                'classifier_attr': self.classifier_attr,
+                'attr_scores': self.attr_scores,
+            }
+            with open(self.state_path, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"[CBR] Failed to save state ({e})")
+
+    def _bucket(self, value: str) -> int:
+        return hash(value) % self.num_buckets
+
+    def _record(self, attr: str, bucket: int, backend: str, backend_latency_ms: float, energy_j: float | None):
+        if self.cost_metric == "latency":
+            cost = backend_latency_ms
+        elif self.cost_metric == "energy":
+            cost = energy_j if energy_j is not None else backend_latency_ms
+        else:  # combined
+            e = energy_j if energy_j is not None else 0.0
+            cost = self.latency_weight * backend_latency_ms + self.energy_weight * e
+        self.stats[attr][bucket][backend].append(cost)
+        self.global_stats[backend].append(cost)
+
+    def _compute_expected(self):
+        self.expected_latency.clear()
+        for attr, buckets in self.stats.items():
+            for b, backend_lat in buckets.items():
+                for backend, lst in backend_lat.items():
+                    if lst:
+                        self.expected_latency[attr][(b, backend)] = sum(lst)/len(lst)
+
+    def _score_attributes(self):
+        # Simple gain-like score: variance reduction of latency across buckets vs global variance
+        global_all = []
+        for v in self.global_stats.values():
+            global_all.extend(v)
+        if len(global_all) < 5:
+            return
+        gmean = sum(global_all)/len(global_all)
+        gvar = sum((x-gmean)**2 for x in global_all)/len(global_all)
+        if gvar <= 1e-9:
+            return
+        scores = {}
+        for attr, buckets in self.stats.items():
+            # weighted within-bucket variance
+            wvar = 0.0
+            total = 0
+            for b, backend_lat in buckets.items():
+                merged = []
+                for lat_list in backend_lat.values():
+                    merged.extend(lat_list)
+                n = len(merged)
+                if n < 2:
+                    continue
+                mean_b = sum(merged)/n
+                var_b = sum((x-mean_b)**2 for x in merged)/n
+                wvar += n * var_b
+                total += n
+            if total < 5:
+                continue
+            wvar /= max(total,1)
+            scores[attr] = max(0.0, gvar - wvar) / gvar
+        if scores:
+            self.attr_scores = scores
+            # pick highest scoring attribute
+            self.classifier_attr = max(scores.items(), key=lambda x: x[1])[0]
+            self._compute_expected()
+
+    def _maybe_dump_json(self):
+        if not self.json_dump_path or self.json_dump_interval <= 0:
+            return
+        if self.decisions % self.json_dump_interval != 0:
+            return
+        import json, os, time as _time
+        snap = {
+            "decisions": self.decisions,
+            "classifier_attr": self.classifier_attr,
+            "attr_scores": self.attr_scores,
+            "samples_collected": self.samples_collected,
+            "cost_metric": self.cost_metric,
+            "latency_weight": self.latency_weight,
+            "energy_weight": self.energy_weight,
+        }
+        try:
+            os.makedirs(os.path.dirname(self.json_dump_path), exist_ok=True)
+            mode = self.json_dump_mode
+            if mode == 'timestamp':
+                base, ext = os.path.splitext(self.json_dump_path)
+                path = f"{base}_{int(_time.time())}{ext or '.json'}"
+                with open(path, 'w') as f:
+                    json.dump(snap, f, indent=2)
+            elif mode == 'append':
+                # append as NDJSON
+                with open(self.json_dump_path, 'a') as f:
+                    f.write(json.dumps(snap) + "\n")
+            else:  # overwrite
+                with open(self.json_dump_path, 'w') as f:
+                    json.dump(snap, f, indent=2)
+        except Exception as e:
+            print(f"[CBR] JSON dump failed: {e}")
+
+    def get_route(self, log_entry: dict) -> str:
+        self.decisions += 1
+        # Phase 1: choose attribute if we haven't yet and enough samples collected
+        if (self.classifier_attr is None and self.samples_collected >= self.warm_samples) or \
+           (self.decisions % self.recompute_interval == 0):
+            self._score_attributes()
+        self._maybe_dump_json()
+
+        # If we have a classifier attribute, try to pick best backend for bucket
+        if self.classifier_attr:
+            val = str(log_entry.get(self.classifier_attr, ""))
+            bucket = self._bucket(val)
+            # Evaluate expected latency per backend for this bucket
+            best_backend = None
+            best_lat = float('inf')
+            for backend in self.backend_order:
+                el = self.expected_latency[self.classifier_attr].get((bucket, backend))
+                if el is not None and el < best_lat:
+                    best_lat = el
+                    best_backend = backend
+            if best_backend is not None:
+                return best_backend
+
+        # Fallback: if we have global stats choose backend with lowest avg latency
+        if self.global_stats:
+            best_backend = None
+            best_lat = float('inf')
+            for backend, lst in self.global_stats.items():
+                if not lst:
+                    continue
+                mean_lat = sum(lst)/len(lst)
+                if mean_lat < best_lat:
+                    best_lat = mean_lat
+                    best_backend = backend
+            if best_backend:
+                return best_backend
+
+        # Final fallback: static rules
+        return self.static.get_route(log_entry)
+
+    def observe(self, *, log_entry: dict, destination: str, success: bool,
+                routing_latency_ms: float, backend_latency_ms: float,
+                energy_cpu_pkg_j: float | None = None):
+        # Sampling: gather stats for a fraction of tuples
+        if random.random() > self.sample_prob:
+            return
+        attr_values = {a: str(log_entry.get(a, "")) for a in self.candidate_attributes}
+        for attr, val in attr_values.items():
+            bucket = self._bucket(val)
+            self._record(attr, bucket, destination, backend_latency_ms, energy_cpu_pkg_j)
+        self.samples_collected += 1
