@@ -7,17 +7,18 @@ import pytest
 from src.routers import A2CRouter
 
 # We will mock A2C.load to avoid requiring a real trained model.
+class DummyExtractor:
+    def __init__(self):
+        from torch import nn
+        self.policy_net = [nn.Linear(10, 5)]
+
+class DummyPolicy:
+    def __init__(self):
+        self.mlp_extractor = DummyExtractor()
+
 class DummyModel:
     def __init__(self):
         self._action = 0
-        class DummyPolicy:
-            class DummyExtractor:
-                def __init__(self):
-                    from torch import nn
-                    # mimic structure enough for metadata obs_dim extraction path
-                    self.policy_net = [nn.Linear(10, 5)]
-            def __init__(self):
-                self.mlp_extractor = DummyModel.DummyPolicy.DummyExtractor()
         self.policy = DummyPolicy()
     def predict(self, obs, deterministic=True):
         # simple heuristic: switch action based on sum sign to exercise path

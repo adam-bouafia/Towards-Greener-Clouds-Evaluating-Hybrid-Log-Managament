@@ -1,2 +1,0 @@
-router,dataset_name,LogsProcessed,TotalEnergyWh,EnergyPerLogWh,CarbonEmissionsKg,AvgLatencyMs,ThroughputLogsPerSec,EmissionsFactorKgPerKWh
-direct_ipfs,Synthetic_Datacenter_Logs,200000,8.444475033366597,4.222237516683299e-05,1.9675626827744173,66.21158825507376,15.103096396775687,0.233

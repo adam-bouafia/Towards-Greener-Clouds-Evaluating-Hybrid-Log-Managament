@@ -102,8 +102,8 @@ def train_q_learning(
     guided_prob: float,
     prior_bonus: float,
     reward_history_inline_threshold: int,
-    reward_history_csv_path: str | None,
-    adaptive_events_path: str | None,
+    reward_history_csv_path: str | None = None,
+    adaptive_events_path: str | None = None,
     sample_mode: str = "head",
 ):
     print(f"[QLEARN] Dataset: {dataset_name}")

@@ -6,18 +6,18 @@ from src.routers import QLearningRouter
 
 # Minimal fake artifacts to test scaling + fallback logic
 
+class FakePCA:
+    def __init__(self):
+        self.n_components_ = 2
+    def transform(self, X):
+        return X[:, :2]
+
+class FakeBinner:
+    def transform(self, X):
+        return (X > 0).astype(int)
+
 def make_artifacts(tmp_prefix):
     q_table = { (0,0): np.array([0.1, 0.2, 0.3], dtype=np.float32) }
-    class FakePCA:
-        def __init__(self):
-            self.n_components_ = 2
-        def transform(self, X):
-            # project to 2 dims by taking first two cols
-            return X[:, :2]
-    class FakeBinner:
-        def transform(self, X):
-            # simple rounding to bins 0/1 for each component
-            return (X > 0).astype(int)
     scaler = {
         'mean': np.zeros(4, dtype=np.float32),
         'std': np.ones(4, dtype=np.float32),

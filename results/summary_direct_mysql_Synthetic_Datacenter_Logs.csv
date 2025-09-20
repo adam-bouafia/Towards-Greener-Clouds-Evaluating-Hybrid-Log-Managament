@@ -1,2 +1,0 @@
-router,dataset_name,LogsProcessed,TotalEnergyWh,EnergyPerLogWh,CarbonEmissionsKg,AvgLatencyMs,ThroughputLogsPerSec,EmissionsFactorKgPerKWh
-direct_mysql,Synthetic_Datacenter_Logs,200000,1.9665055783860352,9.832527891930176e-06,0.45819579976394625,7.914893668914498,126.3440851931428,0.233

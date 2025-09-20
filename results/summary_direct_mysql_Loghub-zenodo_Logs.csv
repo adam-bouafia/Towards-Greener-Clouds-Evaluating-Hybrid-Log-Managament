@@ -1,2 +1,0 @@
-router,dataset_name,LogsProcessed,TotalEnergyWh,EnergyPerLogWh,CarbonEmissionsKg,AvgLatencyMs,ThroughputLogsPerSec,EmissionsFactorKgPerKWh
-direct_mysql,Loghub-zenodo_Logs,14000,0.13237488372264491,9.45534883733178e-06,0.030843347907376268,7.214176492511227,138.61595998352183,0.233

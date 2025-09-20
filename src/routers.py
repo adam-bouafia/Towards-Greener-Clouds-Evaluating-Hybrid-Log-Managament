@@ -9,7 +9,11 @@ import random
 import time
 
 import numpy as np
-from stable_baselines3 import A2C
+try:
+    from stable_baselines3 import A2C  # heavy dependency
+    _A2C_AVAILABLE = True
+except Exception:  # ModuleNotFoundError or other import-time errors
+    _A2C_AVAILABLE = False
 
 from .feature_extractor import LogFeatureExtractor
 from .utils import get_system_state
@@ -175,6 +179,8 @@ class A2CRouter(BaseRouter):
     Pass either '.../a2c_xxx' or '.../a2c_xxx.zip' (we normalize).
     """
     def __init__(self, model_base_path: str):
+        if not _A2C_AVAILABLE:
+            raise RuntimeError("A2C not available: install stable-baselines3 to use A2CRouter")
         base = model_base_path
         if base.lower().endswith(".zip"):
             base = base[:-4]
