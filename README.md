@@ -60,7 +60,7 @@ hybrid-log-management/
   - **CBR (Content-Based Routing):** Online adaptive attribute-based cost minimization (no offline training).
   - **Q-learning:** Tabular RL with PCA + discretization and a teacher-guided exploration.
     - Artifacts now include scaler (mean/std) and metadata JSON for compatibility validation.
-  - **A2C:** Deep RL using Stable-Baselines3.
+  - **A2C:** Deep RL using Stable-Baselines3 (now with configurable hyperparameters, evaluation + metadata artifacts, optional observation scaler, reward CSV export).
   - **Direct Baselines:** Always route to a single backend (`direct_mysql`, etc.).
 - **Semantic Log Understanding:** DistilBERT embeddings of log content.
 - **Energy-Aware Evaluation:** RAPL CPU package Joules → Wh/log + CO₂ estimation.
@@ -100,6 +100,101 @@ Switch to A2C for comparison:
 ```bash
 python -m src --router a2c --model_path trained_models/a2c_log_router --log_source real_world --log_filepath data/Loghub-zenodo_Logs.csv
 ```
+
+### A2C Training Enhancements
+
+Train the A2C agent with the upgraded script:
+
+```bash
+python -m src.train \
+  --timesteps 120000 \
+  --model_path trained_models/a2c_log_router \
+  --log_source real_world \
+  --log_filepath data/Loghub-zenodo_Logs.csv \
+  --sample_mode balanced \
+  --learning_rate 5e-4 \
+  --policy_hidden 256,128 \
+  --n_steps 10 \
+  --n_envs 1 \
+  --eval_interval 10000 \
+  --eval_episodes 5 \
+  --save_best \
+  --scaler_warmup 4000 \
+  --reward_csv_path results/a2c_rewards.csv \
+  --tensorboard_log runs/a2c \
+  --seed 42
+```
+
+Artifacts produced (prefix `trained_models/a2c_log_router`):
+
+| Suffix | Purpose |
+|--------|---------|
+| `.zip` | Final trained policy (A2C) |
+| `_best.zip` | Best eval model (if `--save_best` and eval enabled) |
+| `_metadata.json` | Training metadata (version=1: hyperparams, reward stats, seed, git commit, scaler flags) |
+| `_scaler.pkl` | Optional z-score scaler dict (`mean`, `std`) when `--scaler_warmup > 0` |
+| `a2c_rewards.csv` | (If specified) Per-episode total rewards for plotting |
+
+Key CLI Flags:
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--learning_rate` | Optimizer learning rate | 7e-4 |
+| `--gamma` | Discount factor | 0.99 |
+| `--ent_coef` | Entropy coefficient | 0.0 |
+| `--vf_coef` | Value function loss weight | 0.5 |
+| `--n_steps` | Rollout horizon per update | 5 |
+| `--n_envs` | Parallel env count (DummyVecEnv) | 1 |
+| `--policy_hidden` | Comma list hidden layer sizes (pi & vf) | 128,128 |
+| `--eval_interval` | Evaluate every N steps (0 disables) | 0 |
+| `--eval_episodes` | Episodes per evaluation | 5 |
+| `--save_best` | Save best eval model copy | off |
+| `--scaler_warmup` | Collect this many obs to build mean/std | 0 |
+| `--reward_csv_path` | Write per-episode rewards CSV | None |
+| `--tensorboard_log` | TensorBoard log directory | None |
+| `--seed` | Global RNG seed | None |
+| `--lr_linear_decay` | Linearly decay LR to 0 over training | off |
+| `--ent_anneal` | Enable entropy coefficient annealing | off |
+| `--ent_target` | Target entropy coef (with anneal) | None |
+| `--ent_anneal_steps` | Steps to reach target entropy | None |
+| `--checkpoint_interval` | Save interim checkpoints every N steps | None |
+
+Metadata Schema (version=1):
+```jsonc
+{
+  "version": 1,
+  "timestamp": 1730...,          // epoch seconds
+  "obs_dim": 774,                // observation vector length seen by network
+  "embedding_dim": 768,          // embedding component length (current model)
+  "policy_hidden": [256,128],
+  "total_timesteps": 120000,
+  "learning_rate": 0.0005,
+  "gamma": 0.99,
+  "ent_coef": 0.0,
+  "vf_coef": 0.5,
+  "n_steps": 10,
+  "n_envs": 1,
+  "scaler_present": true,
+  "scaler_warmup": 4000,
+  "reward_mean": 0.42,
+  "reward_std": 0.77,
+  "reward_min": -1.9,
+  "reward_max": 1.8,
+  "eval_best_mean_reward": 0.65,
+  "seed": 42,
+  "git_commit": "a1b2c3d4e5f6"
+  "lr_linear_decay": true,
+  "final_learning_rate": 0.0,
+  "ent_anneal": true,
+  "ent_target": 0.01,
+  "ent_anneal_steps": 60000,
+  "final_ent_coef": 0.01,
+  "checkpoint_interval": 10000,
+  "num_checkpoints": 11
+}
+```
+
+Inference (router) automatically loads `_scaler.pkl` and applies it before prediction if present.
 
 ## 🔧 CBR Parameters
 

@@ -180,11 +180,45 @@ class A2CRouter(BaseRouter):
             base = base[:-4]
         self.model = A2C.load(base)
         self.feature_extractor = LogFeatureExtractor()
+        # Attempt to load optional scaler & metadata (version 1)
+        self.scaler = None
+        self.metadata = {}
+        import json, pickle, os
+        scaler_path = base + "_scaler.pkl"
+        meta_path = base + "_metadata.json"
+        if os.path.isfile(scaler_path):
+            try:
+                with open(scaler_path, 'rb') as f:
+                    sc = pickle.load(f)
+                mean = sc.get('mean'); std = sc.get('std') if isinstance(sc, dict) else (None, None)
+                if mean is not None and std is not None:
+                    self.scaler = {'mean': np.asarray(mean, dtype=np.float32), 'std': np.asarray(std, dtype=np.float32)}
+                    print(f"[A2CRouter] Loaded scaler with dim={self.scaler['mean'].shape[0]}")
+            except Exception as e:
+                print(f"[A2CRouter] Failed to load scaler: {e}")
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, 'r') as f:
+                    self.metadata = json.load(f)
+                ver = self.metadata.get('version')
+                if ver is not None:
+                    print(f"[A2CRouter] Loaded metadata version={ver}")
+            except Exception as e:
+                print(f"[A2CRouter] Failed to load metadata: {e}")
+
+    def _apply_scaler(self, observation: np.ndarray) -> np.ndarray:
+        if not self.scaler:
+            return observation
+        mean = self.scaler.get('mean'); std = self.scaler.get('std')
+        if mean is None or std is None or mean.shape != observation.shape:
+            return observation
+        return (observation - mean) / std
 
     def get_route(self, log_entry: dict) -> str:
         system_state = get_system_state()
         log_embedding = self.feature_extractor.get_embedding(log_entry.get("Content", ""))
         observation = np.concatenate([system_state, log_embedding])
+        observation = self._apply_scaler(observation.astype(np.float32))
 
         action, _ = self.model.predict(observation, deterministic=True)
         backend_map = {0: "mysql", 1: "elk", 2: "ipfs"}
