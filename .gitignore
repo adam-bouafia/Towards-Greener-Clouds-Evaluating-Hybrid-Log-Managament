@@ -1,0 +1,200 @@
+# ----------------------
+# OS / System files
+# ----------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ----------------------
+# IDEs and Editors
+# ----------------------
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs
+.idea/
+*.iml
+
+# Eclipse
+.project
+.classpath
+.settings/
+bin/
+
+# Vim / Emacs
+*~
+.*.swp
+.*.swo
+.dir-locals.el
+
+# ----------------------
+# Python
+# ----------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.venv/
+env/
+venv/
+
+# ----------------------
+# Node / JavaScript
+# ----------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.next/
+.nuxt/
+dist/
+coverage/
+
+# ----------------------
+# Java
+# ----------------------
+*.class
+*.jar
+*.war
+*.ear
+*.log
+hs_err_pid*
+
+# Maven
+target/
+.settings/
+dependency-reduced-pom.xml
+
+# Gradle
+.gradle/
+build/
+
+# ----------------------
+# C / C++
+# ----------------------
+*.o
+*.obj
+*.so
+*.exe
+*.dll
+*.lib
+*.out
+*.a
+*.lo
+*.la
+*.dylib
+
+# ----------------------
+# C#
+# ----------------------
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.mdb
+*.user
+*.cache
+*.suo
+*.csproj.user
+*.dbmdl
+*.bak
+*.log
+.vs/
+
+# ----------------------
+# Go
+# ----------------------
+*.exe
+*.test
+*.out
+vendor/
+bin/
+
+# ----------------------
+# Rust
+# ----------------------
+target/
+Cargo.lock
+
+# ----------------------
+# PHP / Laravel
+# ----------------------
+vendor/
+composer.lock
+*.log
+storage/
+.env
+
+# ----------------------
+# Ruby / Rails
+# ----------------------
+*.gem
+*.rbc
+.bundle/
+vendor/bundle
+log/*
+tmp/
+db/*.sqlite3
+db/*.sqlite3-journal
+/public/system/
+/coverage/
+/spec/tmp/
+/.cache
+
+# ----------------------
+# Android / Gradle
+# ----------------------
+.gradle/
+local.properties
+*.apk
+*.ap_
+*.dex
+*.class
+bin/
+gen/
+out/
+captures/
+.idea/
+*.iml
+
+# ----------------------
+# iOS / Xcode
+# ----------------------
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace
+*.xcuserdata/
+*.xcuserdatad/
+*.moved-aside
+*.ipa
+
+# ----------------------
+# Logs and misc
+# ----------------------
+*.log
+*.gz
+*.zip
+*.tar
+*.7z
+*.bak
+*.tmp
+*.swp
+
+# ----------------------
+# Docker
+# ----------------------
+.docker/
+docker-compose.override.yml
