@@ -109,6 +109,11 @@ def _evaluate_router(router: str, args) -> Dict[str, Any]:
         cmd += ["--cbr_cost_metric", args.cbr_cost_metric]
         if args.cbr_state_path:
             cmd += ["--cbr_state_path", args.cbr_state_path]
+    # compliance pass-through
+    if args.compliance_enable:
+        cmd.append("--compliance_enable")
+        if args.compliance_patterns:
+            cmd += ["--compliance_patterns", args.compliance_patterns]
     rc = _run(cmd)
     perlog_csv = RESULTS_DIR / f"{router}_{dataset_name}.csv"
     summary_csv = RESULTS_DIR / f"summary_{router}_{dataset_name}.csv"
@@ -141,7 +146,17 @@ def _aggregate(perlog_paths: List[Path], dataset_name: str, output_dir: Path) ->
     total_latency = [ _safe_float(r.get('total_latency_ms', 'nan')) for r in rows ]
     success_vals = [ 1.0 if str(r.get('success','')).lower() == 'true' else 0.0 for r in rows ]
     destinations = [ r.get('destination','') for r in rows ]
-    sensitive_vals = [ 1.0 if str(r.get('sensitive','')).lower() == 'true' else 0.0 for r in rows ]
+    sensitive_flags = [ str(r.get('sensitive','')).lower() == 'true' for r in rows ]
+    # Compliance metrics (hard override expectation: all sensitive -> ipfs)
+    sensitive_total = sum(1 for s in sensitive_flags if s)
+    sensitive_to_ipfs = sum(1 for r,s in zip(rows, sensitive_flags) if s and r.get('destination','') == 'ipfs')
+    sensitive_leakage = sensitive_total - sensitive_to_ipfs
+    sensitive_coverage = (sensitive_to_ipfs / sensitive_total) if sensitive_total else 1.0
+    leakage_rate = (sensitive_leakage / sensitive_total) if sensitive_total else 0.0
+    sensitive_fraction = sum(1 for s in sensitive_flags if s) / len(rows) if rows else 0.0
+    non_sensitive_total = len(rows) - sensitive_total
+    non_sensitive_ipfs = sum(1 for r,s in zip(rows, sensitive_flags) if (not s) and r.get('destination','') == 'ipfs')
+    non_sensitive_ipfs_fraction = (non_sensitive_ipfs / non_sensitive_total) if non_sensitive_total else 0.0
     energy_j = [ _safe_float(r.get('energy_cpu_pkg_j','nan')) for r in rows ]
 
     def _pctl(data, p):
@@ -159,7 +174,7 @@ def _aggregate(perlog_paths: List[Path], dataset_name: str, output_dir: Path) ->
     median = _pctl(total_latency, 50)
     mean_latency = (sum(d for d in total_latency if not math.isnan(d))/max(1,len([d for d in total_latency if not math.isnan(d)]))) if total_latency else 0.0
     success_rate = sum(success_vals)/len(success_vals) if success_vals else 0.0
-    sens_frac = sum(sensitive_vals)/len(sensitive_vals) if sensitive_vals else 0.0
+    sens_frac = sensitive_fraction
     dest_counter = Counter(destinations)
     total = sum(dest_counter.values()) or 1
 
@@ -176,6 +191,14 @@ def _aggregate(perlog_paths: List[Path], dataset_name: str, output_dir: Path) ->
         "sensitive_fraction": sens_frac,
         "energy_per_log_j": energy_per_log_j,
         **dest_mix,
+        # compliance metrics
+        "sensitive_total": sensitive_total,
+        "sensitive_to_ipfs": sensitive_to_ipfs,
+        "sensitive_coverage": sensitive_coverage,
+        "sensitive_leakage": sensitive_leakage,
+        "leakage_rate": leakage_rate,
+        "non_sensitive_ipfs_fraction": non_sensitive_ipfs_fraction,
+        "compliance_score": 1.0 if sensitive_leakage == 0 else 0.0,
     }
     return combined
 
@@ -202,6 +225,9 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--output_dir", type=str, default=str(RESULTS_DIR))
     ap.add_argument("--write_markdown", action="store_true", help="Also write markdown table of combined summary")
+    # compliance
+    ap.add_argument("--compliance_enable", action="store_true", help="Enable hard compliance override during evaluation")
+    ap.add_argument("--compliance_patterns", type=str, default=None, help="Additional comma-separated patterns (merged with defaults)")
     return ap.parse_args()
 
 

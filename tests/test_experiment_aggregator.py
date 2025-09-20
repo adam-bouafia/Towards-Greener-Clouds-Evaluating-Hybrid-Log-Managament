@@ -30,3 +30,9 @@ def test_aggregate_basic(tmp_path):
     # destination mix sums to 1 across mysql/elk/ipfs present
     s = agg['destination_mix_mysql'] + agg['destination_mix_elk'] + agg['destination_mix_ipfs']
     assert abs(s - 1.0) < 1e-6
+    # compliance fields present (values predictable with this mock data)
+    for k in [
+        'sensitive_total','sensitive_to_ipfs','sensitive_coverage','sensitive_leakage',
+        'leakage_rate','non_sensitive_ipfs_fraction','compliance_score'
+    ]:
+        assert k in agg

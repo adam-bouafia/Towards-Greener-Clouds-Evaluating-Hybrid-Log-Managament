@@ -1,6 +1,10 @@
 import os, json, pickle
 import numpy as np
 import types
+import importlib.util, pytest
+
+if importlib.util.find_spec("sklearn") is None:
+    pytest.skip("sklearn not installed; skipping q-learning integration test", allow_module_level=True)
 
 from src.train_qlearning import train_q_learning
 from src.routers import QLearningRouter

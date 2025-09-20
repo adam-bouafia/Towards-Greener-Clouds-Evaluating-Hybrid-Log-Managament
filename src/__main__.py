@@ -4,6 +4,7 @@ import itertools
 import os
 import statistics
 import time
+import re
 
 import psutil
 
@@ -15,19 +16,50 @@ from .routers import StaticRouter, QLearningRouter, A2CRouter, DirectRouter, CBR
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-SENSITIVE_LEVELS = {"error", "crit", "alert", "emerg"}
-SENSITIVE_KEYWORDS = ("sshd", "kernel", "denied", "fail", "unauthorized", "forbidden")
+SENSITIVE_LEVELS = {"error", "crit", "alert", "emerg"}  # retained legacy heuristic (may be superseded)
+DEFAULT_COMPLIANCE_PATTERNS = [
+    "sessionid",  # session identifiers
+    "token",       # access / job / security tokens
+    "secret key",  # explicit key reference
+    "permission denied",  # auth failures
+    "login",       # authentication events
+    "/home/",      # user home paths -> potential user identification
+]
 
 
-def _is_sensitive(log: dict) -> bool:
-    lvl = str(log.get("Level", "")).lower()
-    content = (log.get("Content") or "").lower()
-    component = (log.get("Component") or "").lower()
-    if lvl in SENSITIVE_LEVELS:
-        return True
-    if component == "kernel":
-        return True
-    return any(k in content for k in SENSITIVE_KEYWORDS)
+def build_sensitive_matcher(user_patterns: list[str] | None):
+    # Merge user patterns with defaults, keeping order & uniqueness (case-insensitive comparison)
+    pats: list[str] = []
+    for src in [DEFAULT_COMPLIANCE_PATTERNS, user_patterns or []]:
+        for p in src:
+            q = p.strip()
+            if not q:
+                continue
+            if q.lower() not in {x.lower() for x in pats}:
+                pats.append(q)
+    lowered = [p.lower() for p in pats]
+
+    # Precompile simple substring matcher; regex not required unless patterns contain anchors.
+    def _matcher(log: dict) -> bool:
+        content_full = " ".join(
+            [
+                str(log.get("Content", "")),
+                str(log.get("EventTemplate", "")),
+                str(log.get("Component", "")),
+            ]
+        ).lower()
+        lvl = str(log.get("Level", "")).lower()
+
+        # Level-based legacy heuristic (kept for possible critical security/error escalations)
+        if lvl in SENSITIVE_LEVELS:
+            return True
+
+        for pat in lowered:
+            if pat in content_full:
+                return True
+        return False
+
+    return _matcher, pats
 
 
 def _normalize_model_base(p: str | None) -> str:
@@ -106,6 +138,14 @@ def main():
     parser.add_argument("--cbr_energy_weight", type=float, default=1000.0, help="CBR: energy weight for combined cost")
     parser.add_argument("--cbr_json_dump_mode", choices=["overwrite", "append", "timestamp"], default="overwrite", help="CBR: JSON dump writing mode")
     parser.add_argument("--cbr_state_path", type=str, default=None, help="CBR: path to persist learned stats between runs")
+    # --- Compliance (hard override) ---
+    parser.add_argument("--compliance_enable", action="store_true", help="Enable hard compliance routing override (force sensitive logs to IPFS)")
+    parser.add_argument(
+        "--compliance_patterns",
+        type=str,
+        default=None,
+        help="Comma-separated additional substring patterns to classify a log as sensitive (merged with defaults)",
+    )
     args = parser.parse_args()
 
     dataset_name = os.path.splitext(os.path.basename(args.log_filepath or ""))[0] or args.log_source
@@ -128,6 +168,11 @@ def main():
     ) if args.router == "cbr" else {}
 
     router = _build_router(args.router, args.model_path, **cbr_kwargs)
+
+    user_pattern_list = []
+    if args.compliance_patterns:
+        user_pattern_list = [p.strip() for p in args.compliance_patterns.split(',') if p.strip()]
+    sensitive_fn, effective_patterns = build_sensitive_matcher(user_pattern_list)
     meter = EnergyMeter()
     proc = psutil.Process(os.getpid())
 
@@ -152,11 +197,19 @@ def main():
             processed += 1
 
             payload_bytes = len((log_entry.get("Content") or "").encode("utf-8"))
-            sensitive = _is_sensitive(log_entry)
+            sensitive = sensitive_fn(log_entry) if args.compliance_enable else False
 
             t0 = time.perf_counter()
-            destination = router.get_route(log_entry)
+            raw_destination = router.get_route(log_entry)
             routing_latency_ms = (time.perf_counter() - t0) * 1000.0
+
+            compliance_forced = False
+            # Hard override: enforce IPFS for sensitive logs when compliance enabled
+            if args.compliance_enable and sensitive and raw_destination != "ipfs":
+                destination = "ipfs"
+                compliance_forced = True
+            else:
+                destination = raw_destination
 
             backend_write_latency_ms = 0.0
             success = True
@@ -214,6 +267,8 @@ def main():
                     "router": args.router,
                     "dataset_name": dataset_name,
                     "destination": destination,
+                    "raw_destination": raw_destination,
+                    "compliance_forced": compliance_forced,
                     "routing_latency_ms": routing_latency_ms,
                     "backend_write_latency_ms": backend_write_latency_ms,
                     "total_latency_ms": total_latency_ms,
@@ -280,6 +335,8 @@ def main():
                 "AvgLatencyMs",
                 "ThroughputLogsPerSec",
                 "EmissionsFactorKgPerKWh",
+                "ComplianceEnabled",
+                "CompliancePatterns",
             ],
         )
         writer.writeheader()
@@ -294,6 +351,8 @@ def main():
                 "AvgLatencyMs": avg_latency_ms,
                 "ThroughputLogsPerSec": throughput,
                 "EmissionsFactorKgPerKWh": float(args.emissions_kg_per_kwh),
+                "ComplianceEnabled": args.compliance_enable,
+                "CompliancePatterns": ";".join(effective_patterns) if args.compliance_enable else "",
             }
         )
     print(f"Summary saved to {summary_path}")

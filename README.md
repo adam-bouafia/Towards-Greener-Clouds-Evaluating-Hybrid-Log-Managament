@@ -299,6 +299,8 @@ What happens:
 | `--seed` | RNG seed (passed to A2C) | None |
 | `--output_dir` | Directory for combined outputs | results |
 | `--write_markdown` | Emit Markdown summary table | off |
+| `--compliance_enable` | Force sensitive logs (pattern match) to IPFS | off |
+| `--compliance_patterns` | Extra comma patterns merged with defaults | None |
 
 ### Fairness & Interpretation
 
@@ -317,10 +319,101 @@ What happens:
 | `results/combined_summary_<dataset>.csv` | Cross-router aggregate metrics |
 | `results/combined_summary_<dataset>.md` | (Optional) Markdown table |
 | `results/experiment_metadata_<dataset>.json` | Run metadata (timings, training reused status) |
+| `results/combined_summary_<dataset>.csv` | Includes compliance metrics when enabled |
 
 ### Extending
 
 Add new router names to `DEFAULT_ROUTERS` in `src/experiment.py` and ensure `__main__.py` can build them. The aggregator will pick up any additional per-log CSV automatically if included in `--routers`.
+
+---
+
+## 🛡️ Compliance (Hard Enforcement to IPFS)
+
+When `--compliance_enable` is provided (either to a direct `python -m src ...` run or via the orchestrator / menu), **all logs matching sensitive patterns are forcibly routed to IPFS**, regardless of the adaptive router's chosen destination.
+
+### Default Sensitive Patterns
+
+```text
+sessionid, token, secret key, permission denied, login, /home/
+```
+
+You may extend these with `--compliance_patterns "email,credential"` (case-insensitive substring matching). The effective pattern list is recorded in each per-router summary CSV when compliance is enabled.
+
+### Rationale
+
+IPFS is treated as the immutable, tamper-evident audit store. Hard enforcement ensures 100% coverage (zero leakage) for security / regulatory contexts while allowing adaptive optimization on the remaining discretionary logs.
+
+### Per-Log Fields Added
+
+| Column | Meaning |
+|--------|---------|
+| `raw_destination` | Router's original choice prior to compliance override |
+| `compliance_forced` | True if override changed destination to IPFS |
+
+### Aggregated Compliance Metrics (in combined summary)
+
+| Metric | Definition |
+|--------|------------|
+| `sensitive_total` | Number of logs classified sensitive |
+| `sensitive_to_ipfs` | Sensitive logs actually stored in IPFS |
+| `sensitive_coverage` | sensitive_to_ipfs / sensitive_total (==1.0 expected) |
+| `sensitive_leakage` | sensitive_total - sensitive_to_ipfs (==0 expected) |
+| `leakage_rate` | sensitive_leakage / sensitive_total |
+| `non_sensitive_ipfs_fraction` | Fraction of non-sensitive logs sent to IPFS |
+| `compliance_score` | 1.0 if leakage == 0 else 0.0 |
+
+### Example (Orchestrator with Compliance)
+
+```bash
+python -m src.experiment \
+  --log_filepath data/Loghub-zenodo_Logs.csv \
+  --routers q_learning,a2c,cbr \
+  --q_episodes 20 \
+  --a2c_timesteps 20000 \
+  --compliance_enable \
+  --compliance_patterns sessionid,token
+```
+
+---
+
+## 🧭 Interactive Experiment Menu
+
+A convenience interface to launch common experiment profiles without memorizing long command lines.
+
+Run:
+
+```bash
+python -m src.menu --log_filepath data/Loghub-zenodo_Logs.csv
+```
+
+### Menu Options
+
+| Option | Description |
+|--------|-------------|
+| 1 | Smoke run (fast; limited episodes/timesteps) |
+| 2 | Full run (longer training; all routers) |
+| 3 | Compliance smoke run (smoke + hard compliance) |
+| 4 | Train only (retrain RL artifacts, no multi-router evaluation) |
+| 5 | Custom (prompt for parameters including compliance) |
+
+Outputs are placed in the specified `--output_dir` (default `results/menu_runs`).
+
+### Non-Interactive Presets
+
+```bash
+# Smoke
+python -m src.menu --preset smoke --log_filepath data/Loghub-zenodo_Logs.csv
+
+# Compliance smoke (explicit)
+python -m src.menu --preset compliance_smoke --log_filepath data/Loghub-zenodo_Logs.csv
+
+# Force compliance on any preset + add patterns
+python -m src.menu --preset smoke --compliance --extra_patterns sessionid,token,permission denied --log_filepath data/Loghub-zenodo_Logs.csv
+```
+
+Internally this wraps `python -m src.experiment` with the appropriate arguments.
+
+---
 
 ---
 

@@ -3,6 +3,11 @@ import json
 import pickle
 import numpy as np
 import pytest
+import importlib.util
+
+# Skip if heavy dependency (torch) not installed
+if importlib.util.find_spec("torch") is None:
+    pytest.skip("torch not installed; skipping A2C router test", allow_module_level=True)
 
 from src.routers import A2CRouter
 

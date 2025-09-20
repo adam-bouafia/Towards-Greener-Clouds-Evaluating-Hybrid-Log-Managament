@@ -1,0 +1,2 @@
+dataset_name,rows,mean_total_latency_ms,median_total_latency_ms,p95_total_latency_ms,success_rate,sensitive_fraction,energy_per_log_j,destination_mix_mysql,destination_mix_elk,destination_mix_ipfs
+Loghub-zenodo_Logs,42000,6.631233906323143,6.817019999289187,6.455059297514339,1.0,0.23257142857142857,0.1949375045952381,0.9028095238095238,0.032214285714285716,0.06497619047619048

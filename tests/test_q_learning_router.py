@@ -2,6 +2,11 @@ import os
 import pickle
 import json
 import numpy as np
+import importlib.util, pytest
+
+if importlib.util.find_spec("sklearn") is None:
+    pytest.skip("sklearn not installed; skipping q-learning router tests", allow_module_level=True)
+
 from src.routers import QLearningRouter
 
 # Minimal fake artifacts to test scaling + fallback logic

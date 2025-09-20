@@ -1,0 +1,50 @@
+{
+  "dataset_name": "Loghub-zenodo_Logs",
+  "start_time": 1758399755.935645,
+  "routers_requested": "q_learning,a2c,cbr",
+  "force_retrain": false,
+  "routers": [
+    "q_learning",
+    "a2c",
+    "cbr"
+  ],
+  "training": {
+    "q_learning": true,
+    "a2c": true
+  },
+  "evaluation": [
+    {
+      "router": "q_learning",
+      "status": "ok",
+      "perlog_csv": "/home/neo/Documents/hybrid-log-management/results/q_learning_Loghub-zenodo_Logs.csv",
+      "summary_csv": "/home/neo/Documents/hybrid-log-management/results/summary_q_learning_Loghub-zenodo_Logs.csv"
+    },
+    {
+      "router": "a2c",
+      "status": "ok",
+      "perlog_csv": "/home/neo/Documents/hybrid-log-management/results/a2c_Loghub-zenodo_Logs.csv",
+      "summary_csv": "/home/neo/Documents/hybrid-log-management/results/summary_a2c_Loghub-zenodo_Logs.csv"
+    },
+    {
+      "router": "cbr",
+      "status": "ok",
+      "perlog_csv": "/home/neo/Documents/hybrid-log-management/results/cbr_Loghub-zenodo_Logs.csv",
+      "summary_csv": "/home/neo/Documents/hybrid-log-management/results/summary_cbr_Loghub-zenodo_Logs.csv"
+    }
+  ],
+  "combined_summary": {
+    "dataset_name": "Loghub-zenodo_Logs",
+    "rows": 42000,
+    "mean_total_latency_ms": 6.631233906323143,
+    "median_total_latency_ms": 6.817019999289187,
+    "p95_total_latency_ms": 6.455059297514339,
+    "success_rate": 1.0,
+    "sensitive_fraction": 0.23257142857142857,
+    "energy_per_log_j": 0.1949375045952381,
+    "destination_mix_mysql": 0.9028095238095238,
+    "destination_mix_elk": 0.032214285714285716,
+    "destination_mix_ipfs": 0.06497619047619048
+  },
+  "end_time": 1758401665.1691,
+  "elapsed_sec": 1909.2334549427032
+}

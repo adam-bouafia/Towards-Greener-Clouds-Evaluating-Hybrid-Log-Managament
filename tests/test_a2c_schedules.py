@@ -1,4 +1,9 @@
 import numpy as np
+import importlib.util, pytest
+
+if importlib.util.find_spec("torch") is None:
+    pytest.skip("torch not installed; skipping A2C schedule tests", allow_module_level=True)
+
 from src.train import LRScheduleCallback, EntropyAnnealCallback
 
 class DummyModel:

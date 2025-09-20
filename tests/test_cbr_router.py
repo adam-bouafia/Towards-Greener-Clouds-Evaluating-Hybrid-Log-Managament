@@ -1,4 +1,9 @@
 import time
+import importlib.util, pytest
+
+if importlib.util.find_spec("torch") is None:
+    pytest.skip("torch not installed; skipping CBR router tests", allow_module_level=True)
+
 from src.routers import CBRRouter, StaticRouter
 
 
