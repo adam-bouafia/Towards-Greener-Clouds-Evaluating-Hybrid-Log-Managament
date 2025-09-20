@@ -1,0 +1,75 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql_db
+    restart: unless-stopped
+    environment:
+      MYSQL_USER: log_user
+      MYSQL_PASSWORD: your_strong_password
+      MYSQL_ROOT_PASSWORD: your_password
+      MYSQL_DATABASE: logs_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ulog_user", "-pyour_strong_password"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200" 
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    restart: unless-stopped
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  ipfs:
+    image: ipfs/kubo:latest
+    container_name: ipfs_node
+    restart: unless-stopped
+    environment:
+      - IPFS_PROFILE=server
+    command: ["daemon", "--migrate=true", "--enable-gc"]
+    ports:
+      - "5001:5001"  # API
+      - "8080:8080"  # Gateway (optional)
+      - "4001:4001"  # Swarm (optional)
+    volumes:
+      - ipfs_data:/data/ipfs
+      - ipfs_staging:/export 
+
+volumes:
+  db_data:
+  es_data:
+  ipfs_data:
+  ipfs_staging:
