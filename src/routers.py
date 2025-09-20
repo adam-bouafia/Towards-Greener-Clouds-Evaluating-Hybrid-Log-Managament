@@ -71,10 +71,16 @@ class QLearningRouter(BaseRouter):
         self.log_feature_extractor = LogFeatureExtractor()
         self.backend_map = {0: "mysql", 1: "elk", 2: "ipfs"}
         self.static = StaticRouter()
+        self._warned_incompatible = False
 
         q_table_path = f"{model_path_prefix}_q_table.pkl"
         pca_path = f"{model_path_prefix}_pca.pkl"
         binner_path = f"{model_path_prefix}_binner.pkl"
+        scaler_path = f"{model_path_prefix}_scaler.pkl"
+        meta_path = f"{model_path_prefix}_metadata.json"
+
+        self.scaler = None
+        self.metadata = {}
 
         try:
             with open(q_table_path, "rb") as f:
@@ -83,16 +89,68 @@ class QLearningRouter(BaseRouter):
                 self.pca = pickle.load(f)
             with open(binner_path, "rb") as f:
                 self.binner = pickle.load(f)
+            try:
+                with open(scaler_path, "rb") as f:
+                    self.scaler = pickle.load(f)
+            except FileNotFoundError:
+                self.scaler = None
+            try:
+                import json
+                with open(meta_path, "r") as f:
+                    self.metadata = json.load(f)
+                if self.metadata:
+                    ver = self.metadata.get("version")
+                    print(f"[QLRouter] Loaded metadata version={ver}")
+            except FileNotFoundError:
+                self.metadata = {}
         except FileNotFoundError as e:
             print(f"[QLRouter] Warning: {e}. Falling back to default Static routing.")
             self.q_table = {}
             self.pca = None
             self.binner = None
+            self.scaler = None
+
+        # Basic compatibility validation
+        if self.pca is not None and self.scaler is not None:
+            mean = self.scaler.get("mean")
+            std = self.scaler.get("std")
+            if mean is None or std is None:
+                self._invalidate("Scaler missing mean/std")
+            else:
+                self.obs_dim = int(mean.shape[0])
+                meta_dim = self.metadata.get("obs_dim")
+                if meta_dim is not None and meta_dim != self.obs_dim:
+                    self._invalidate(f"Obs dim mismatch meta={meta_dim} scaler={self.obs_dim}")
+                # Forward compatibility notice
+                meta_ver = self.metadata.get("version")
+                if isinstance(meta_ver, int) and meta_ver > 3:  # supported up to version 3 currently
+                    print(f"[QLRouter] Warning: metadata version {meta_ver} > supported 3; attempting best-effort load.")
+        elif self.pca is not None and self.scaler is None:
+            print("[QLRouter] No scaler found; will attempt raw PCA transform (may degrade accuracy).")
+
+    def _invalidate(self, reason: str):
+        print(f"[QLRouter] Incompatible artifacts: {reason}. Falling back to Static policy.")
+        self.pca = None
+        self.binner = None
+        self.scaler = None
+
+    def _apply_scaler(self, vec: np.ndarray) -> np.ndarray:
+        if self.scaler is None:
+            return vec
+        mean = self.scaler.get("mean")
+        std = self.scaler.get("std")
+        if mean is None or std is None:
+            if not self._warned_incompatible:
+                print("[QLRouter] Scaler corrupt; ignoring.")
+                self._warned_incompatible = True
+            return vec
+        return (vec - mean) / std
 
     def _discretize_state(self, observation: np.ndarray) -> tuple | None:
         if self.pca is None or self.binner is None:
             return None
-        reduced = self.pca.transform(observation.reshape(1, -1))
+        vec = self._apply_scaler(observation.astype(np.float32))
+        reduced = self.pca.transform(vec.reshape(1, -1))
         bins = self.binner.transform(reduced)
         return tuple(int(x) for x in bins[0])
 
