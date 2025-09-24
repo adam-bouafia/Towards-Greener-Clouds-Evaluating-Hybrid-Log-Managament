@@ -1,0 +1,2 @@
+router,dataset_name,LogsProcessed,TotalEnergyWh,EnergyPerLogWh,CarbonEmissionsKg,AvgLatencyMs,ThroughputLogsPerSec,EmissionsFactorKgPerKWh,ComplianceEnabled,CompliancePatterns
+direct_elk,Loghub-zenodo_Logs,14000,0.39817472083333333,2.844105148809524e-05,0.09277470995416667,4.956283009016521,197.72569302856323,0.233,False,

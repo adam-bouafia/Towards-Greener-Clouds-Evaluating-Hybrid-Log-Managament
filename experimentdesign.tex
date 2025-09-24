@@ -1,0 +1,2023 @@
+\chapter{Experiment Design}\label{ch:experiment-design}
+
+This chapter is organized into eight sections. Section~\ref{s:architecture-design} presents the overall \emph{System Architecture}, detailing the data flow across ingestion, feature extraction, routing, storage tiers, and compliance hooks. Section~\ref{s:routing-governance} formalizes the \emph{Routing \& Governance Algorithms}, covering baseline heuristics, content-based routing, reinforcement learning policies, and the hard compliance override layer. Section~\ref{s:energy-measurement} defines the \emph{Energy \& Performance Measurement} instrumentation: latency timing envelope, RAPL-based energy attribution, and combined cost formulation. Section~\ref{s:experimental-setup} specifies the \emph{Experimental Setup}—datasets, sampling modes, hardware/software environment, control parameters and output artifacts. Section~\ref{s:orchestration} describes \emph{Orchestration \& Automation}, including unified training reuse, multi-router evaluation sequencing, aggregation, and compliance pairing. Section~\ref{s:implementation-details} provides concrete \emph{Implementation Details}, citing key code structures, artifact file schemas, and data-path optimizations. Section~\ref{s:evaluation-methodology} lays out the \emph{Evaluation Methodology}, defining the comparative metrics, fairness assumptions, and statistical treatment. Finally, Section~\ref{s:validation-reproducibility} documents the \emph{Validation \& Reproducibility} controls: deterministic sampling, containerized service capture, measurement integrity safeguards, and artifact metadata/versioning.
+\section{System Architecture}\label{s:architecture-design}
+
+The core of our framework is a routing mechanism designed to balance the integrity requirements of a log entry against performance and energy costs. A central 'router' component, which can operate on either static rules or a learned, adaptive policy, makes the decision on where to send and dispatch each incoming log entry. The system includes several key components that handle log ingestion, state representation, decision making, action execution, and performance measurement. We evaluated this setup using two distinct log sources to test its behavior under different conditions representing a realistic, moderately sized workload, as all incoming logs from either source were processed and dispatched to one of three distinct backend systems, each chosen for a specific purpose: MySQL for structured transactional logs, Elasticsearch for search and analytics, and IPFS to provide an immutable tamper-evident archive. To ensure consistency and isolation, the entire experiment was performed within Docker containers, and the complete data flow from log ingestion through routing to final storage is shown in Figure~\ref{fig:system-architecture}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.99\linewidth]{vu-cs-standard-thesis/0_frontmatter/figures/system.png}
+\caption{An overview of the system architecture, showing the flow from log generation through the routing layer to the various storage backends.}
+\label{fig:system-architecture}
+\end{figure}
+
+
+
+\subsection{End-to-End Data flow}
+Each log record follows a strictly determined pipeline path, including ingestion, feature construction, routing decision, possible compliance override, backend dispatch, and metric capture. On arrival, a log line and its parsed structured fields are retrieved sequentially from the configured provider (real-world or synthetic dataset) using the LogProvider abstraction (log\_provider.py). 
+The system constructs an observation vector by combining semantic using DislisBERT encoder and system-level signals as explained in \ref{subsec:observation-feature-construction}. This vector, together with the raw log metadata, was presented to the active routing strategy. 
+The router, whether a static heuristic, content-based strategy (CBR), tabular Q‑learning policy, A2C policy, or fixed “direct” baseline, returns a provisional destination in {MySQL, ELK, IPFS}. For CBR specifically, the decision first consults bucketed attribute statistics; if these are not yet reliable, it may fall back to global averages, and if these are absent, to the static heuristic. This is the only branch that meaningfully changes the control flow before governance and mostly appears during cold starts.
+
+\paragraph{A brief look at the CBR fallback in code}
+As introduced in the background, content-based routing (CBR) learns correlations between tuple content and operator selectivity using a \emph{classifier attribute}. In our setting:
+- tuple $\rightarrow$ log record; operator ordering $\rightarrow$ backend choice
+- selectivity/cost $\rightarrow$ per-backend processing cost (latency, energy, or a weighted combination)
+- classifier attribute $\rightarrow$ a field from \{\texttt{Level}, \texttt{Component}, \texttt{LogSource}\} that best explains the cost variation.
+
+Specifically, CBR maintains bucketed statistics per candidate attribute by hashing the attribute values into a fixed number of buckets. During the warm‑up phase, the router samples a fraction of requests and accumulates per-bucket/per-backend costs. Periodically, it scores attributes using a variance‑reduction criterion (global variance minus weighted within‑bucket variance, normalized), selecting the attribute that most strongly correlates content with the backend cost. At decision time, it consults the selected attribute bucket to choose the backend with the lowest expected cost. When bucketed or global estimates are not yet reliable (early in the run), a fallback chain preserves the correctness and reduces the variance.
+
+The fallback chain in our implementation is compact. In high-level terms: try the chosen attribute’s bucket; if no estimate is available there, use global backend means; otherwise, fall back to static rules. The excerpt below mirrors the core of \texttt{CBRRouter.get\_route} in \texttt{src/routers.py}. (Here, “sufficient” simply means an expected value exists—i.e., at least one sample for that \emph{(attribute bucket, backend)}.)
+
+\begin{lstlisting}[language=Python, caption={CBR fallback (excerpt from src/routers.py, CBRRouter.get\_route)}]
+# If an attribute has been selected, try bucket-level expected costs
+if self.classifier_attr:
+    val = str(log_entry.get(self.classifier_attr, ""))
+    bucket = self._bucket(val)
+    best_backend, best_cost = None, float('inf')
+    for the backend in self.backend_order:
+        el = self.expected_latency[self.classifier_attr].get((bucket, backend))
+        if el is not None and el < best_cost:
+            best_backend, best_cost = backend, el
+    if best_backend is not None:
+        return best_backend
+
+# Otherwise fall back to global averages if we have any samples at all
+if self.global_stats:
+    best_backend, best_cost = None, float('inf')
+    for backend, lst in self.global_stats.items():
+        if not lst:
+            continue
+        mean_cost = sum(lst) / len(lst)
+        if mean_cost < best_cost:
+            best_backend, best_cost = backend, mean_cost
+    if best_backend:
+        return best_backend
+
+# Final fallback: static heuristic
+return self.static.get_route(log_entry)
+\end{lstlisting}
+
+
+Before dispatch, a mandatory governance layer enforces compliance constraints: if the log text matches any sensitive pattern (“token,” “permission denied”), the destination is irrevocably reassigned to IPFS, recording both the original (raw\_destination) and enforced (destination) values. The selected backend adapter then executes the write using its native client (SQL insert, Elasticsearch index request, IPFS add), while the metrics module samples high-resolution timing and (where supported) CPU energy counters (RAPL) immediately before and after the operation. Per-log measurements (latency, energy joules, success flag, backend, compliance override status) are streamed to a per-router comma-separated values (CSV) trace. After the full stream, an orchestration layer aggregates the traces into cross-router summary artifacts (distributional latency percentiles, destination mix, energy averages, and compliance coverage). Crucially, adaptive learning (Q-Learning updates, A2C gradient steps) occurs only in dedicated training phases; evaluation runs freeze RL policies, whereas CBR alone continues its intrinsic online statistical updates (by design) to remain faithful to the content-driven adaptation.
+
+\paragraph{Execution Flow}
+
+
+The per-log processing pipeline enforces a strict separation between (i) deterministic data provisioning, (ii) policy inference, (iii) governance (compliance override), and (iv) physical persistence and instrumentation. For each log $i$ drawn from the (seeded) sampling iterator:
+\begin{enumerate}
+  \item \textbf{Deterministic Fetch:} Obtain the next raw log record $L_i$ from the pre-defined ordering produced by the chosen sampling mode (e.g., head, random, balanced), fixed by the global seed.
+  \item \textbf{Observation Construction:} Construct the feature vector $x_i = [f_{\text{sys}}(L_i) \,\Vert\, f_{\text{text}}(L_i)]$ (system metrics + semantic embedding), optionally applying a stored scaler/PCA/discretizer (for tabular RL) or scaler only (for A2C).
+  \item \textbf{Routing Proposal:} The active router policy $\pi$ maps $x_i$ to a provisional destination $d_i^{\text{raw}} \in \{\text{mysql}, \text{elk}, \text{ipfs}\}$ (or action space subset).
+  \item \textbf{Compliance Governance:} If $L_i$ matches any sensitive pattern (case-insensitive substring in the configured set), enforce $d_i := \text{ipfs}$ and record the override; otherwise set $d_i := d_i^{\text{raw}}$.
+  \item \textbf{Backend Write \& Instrumentation:} Persist $L_i$ to backend $d_i$, bracketing the operation with a monotonic timing span to obtain latency $\ell_i$, and reading RAPL package energy counters before/after to attribute $\Delta E_i$ when supported.
+  \item \textbf{Trace Emission:} Append a structured per-log row (fields: identifiers, $d_i^{\text{raw}}$, $d_i$, compliance flag, $\ell_i$, $\Delta E_i$, timestamp, router metadata) to the active run CSV.
+  \item \textbf{Learning Update (Training Mode Only):} If the router is in a training phase (e.g., Q-Learning episode or A2C rollout collection), apply the observed reward $r_i$ and (where applicable) update Q-table entries, exploration schedules, or enqueue experience for batch updates.
+  \item \textbf{Termination Check:} Continue until dataset exhaustion (evaluation) or episode horizon / timestep budget (training) is reached.
+\end{enumerate}
+This modular partition---\emph{policy decision}, then \emph{governance override}, then \emph{physical persistence}---preserves security invariants (sensitive logs \emph{always} land in IPFS) while allowing optimization dynamics (latency/energy trade-offs) to evolve independently and reproducibly.
+
+\subsection{Storage Backend Roles (MySQL / ELK / IPFS)}
+
+The three storage tiers are intentionally heterogeneous, each optimized for a distinct quality dimension.
+
+MySQL (Transactional Performance): Provides low-latency structured insertion and indexed retrieval for routine operational logs. Its row-oriented storage and mature transaction engine provide predictable insertion latency, forming a performance lower bound; the router exploits MySQL for high-frequency, low-criticality events that benefit from fast confirmation.
+
+Elasticsearch (Analytical Query Capability): Serves as a schema-flexible, inverted-indexed search and aggregation engine. Although write latency can exceed that of MySQL due to indexing overhead and potential refresh intervals, ELK enables downstream exploratory analysis (filtering by fields, aggregating over time windows). The router leverages ELK for logs that are likely to yield future investigative value (e.g., error clusters and service anomalies).
+
+IPFS (Integrity\& Immutability): Functions as a content-addressed, tamper-evident store. Each log (or batch representation) is hashed, and retrieval by CID guarantees integrity. Native latency and energy overhead are higher relative to local database inserts; however, the assurance of non-repudiation and auditability makes IPFS the canonical sink for sensitive or compliance-relevant events (access failures, credential markers). The compliance layer enforces mandatory routing to the IPFS for marked content, ensuring a leakage of 0 for the sensitive class.
+
+Design Rationale: A single monolithic backend cannot jointly optimize low latency, deep search semantics, and cryptographic integrity. The tri-tier design externalizes these orthogonal concerns, allowing the adaptive algorithms to learn or infer routing decisions that trade off moment-to-moment performance (latency, energy) against downstream analytical and governance objectives.
+
+Operational Isolation: Each backend runs inside a dedicated Docker container with predefined resource limits, minimizing cross-tier interference and ensuring repeatability. Disposal or reset of one container does not invalidate the artifacts (models, statistics) associated with another tier, reinforcing modularity
+
+\subsection{Observation \& Feature Construction (Embedding + System Metrics)}\label{subsec:observation-feature-construction}
+
+
+Effective routing requires a representation that captures both the textual semantics and runtime context. For each log entry, the system constructs a fixed-length observation vector composed of:
+
+1. Semantic Embedding (Dim ~768): A transformer-based sentence embedding (DistilBERT variant) of the raw or templated log message. This encodes the latent structure—error type, component, user action—facilitating discrimination between logs whose surface forms differ but semantics align.
+
+2. System / Context Metrics (Dim ~6): Lightweight numerical features reflecting the current runtime or log attributes, such as normalized message length, severity encoding, time-since-previous-log, rolling backend latency estimates, recent failure ratio, and possibly a categorical hash indicator. (Exact set documented in metadata artifacts; fixed schema across runs.)
+
+The final observation vector (dimension ≈ 774) is the concatenation [context\_metrics || embedding]. Prior to use by the RL algorithms, the training pipeline standardizes each dimension (mean/standard deviation) to stabilize both the PCA projection (for Q-learning discretization) and A2C’s neural optimization.
+
+\begin{lstlisting}[language=Python, caption={State Discretization}]
+norm = (obs - mean) / std
+pc = PCA.transform(norm)
+bins = discretizer.quantile_bins(pc)
+state = tuple(bins)
+\end{lstlisting}
+
+State Transformation for Q-Learning: To render the high-dimensional continuous space tractable for a tabular method, observations undergo:
+
+Z-Score Scaling (per-dimension normalization).
+PCA Projection (retaining k=16 principal components).
+Quantile Binning (KBins, n=8) per principal component to obtain approximately equiprobable bins.
+The resulting 16-tuple of bin indices forms the discrete state key. This pipeline preserves relative semantic/topological relationships while constraining the reachable state cardinality, enabling efficient exploration and interpretability (each component/bin boundary is stable and recorded in the artifacts).
+
+A2C Input Path: The same (optionally scaled) continuous observation (pre-PCA) is provided directly to the actor-critic network, leveraging the continuous capacity for smoother policy gradients without discretization loss.
+
+Sampling Modes: A configurable sampling policy (“head,” “random,” “balanced”) governs the order and class stratification of logs, ensuring that representation learning and statistical estimates (e.g., CBR attribute buckets) are not biased by dataset ordering artifacts. The chosen sampling strategy is recorded in the metadata JSON of every model to guarantee reproducibility.
+
+Robustness\& Forward Compatibility: All artifact metadata serialize the observed dimension lengths (obs\_dim, embedding\_dim). During inference, mismatches (e.g., embedding model changes) trigger safe fallback behavior (reverting to static routing) rather than producing undefined decisions, explicitly preserving system integrity under feature evolution.
+\section{Routing \& Governance Algorithms}\label{s:routing-governance} 
+\subsection{Baseline Policies (Static Heuristic, Direct Backends)}
+\label{subsec:baseline-policies}
+
+We evaluated adaptive routing methods against two families of non-learning baselines: (i) \emph{direct backends}, which always route every log to a single storage system, and (ii) a lightweight \emph{static heuristic} that encodes domain knowledge about security relevance and diagnostic value. Let the set of candidate backends be
+\[
+\mathcal{B} = \{\text{MySQL}, \text{ELK}, \text{IPFS}\},
+\]
+corresponding respectively to (low-latency structured writes), (search/analytics), and (immutable content-addressed archival).
+
+\paragraph{Direct Backends.}
+Each direct baseline defines a constant policy
+\[
+\pi_{\text{direct}}^{(b)}(x) = b \quad \forall x,
+\]
+for a fixed backend $b \in \mathcal{B}$. These baselines establish lower or upper bounds in specific resource dimensions (e.g., all-MySQL minimizes routing complexity and often latency, and all-IPFS maximizes immutability and archival overhead).
+
+\paragraph{Static Heuristic Policy.}
+The static heuristic $\pi_{\text{static}}$ implements a small ordered rule list over the extracted categorical/lexical features of a log entry $x$. Let:
+\begin{itemize}
+  \item $L(x)$: normalized severity level (lower-cased string),
+  \item $S(x)$: normalized source identifier (e.g., process or service),
+  \item $C(x)$: component field,
+  \item $\mathrm{text}(x)$: lower-cased free-form message content.
+\end{itemize}
+Define the indicator predicates as follows:
+\[
+\begin{aligned}
+\mathrm{isSecCrit}(x)\&= \mathbb{I}\big(L(x) \in \{\texttt{crit},\texttt{alert},\texttt{emerg}\} \lor C(x)=\texttt{kernel} \lor S(x)=\texttt{openssh}\big),\\
+\mathrm{isDiagErr}(x)\&= \mathbb{I}\big(L(x)\in\{\texttt{err},\texttt{error},\texttt{warn}\} \lor (\texttt{fail} \in \mathrm{text}(x)) \lor (\texttt{denied}\in \mathrm{text}(x))\big).
+\end{aligned}
+\]
+The decision function is as follows:
+\[
+\pi_{\text{static}}(x) =
+\begin{cases}
+\text{IPFS},\& \text{if } \mathrm{isSecCrit}(x)=1,\\
+\text{ELK}, \& \text{else if } \mathrm{isDiagErr}(x)=1,\\
+\text{MySQL},& \text{otherwise}.
+\end{cases}
+\]
+
+\paragraph{Rationale.}
+Security- or kernel-related events (e.g., authentication anomalies and privilege escalations) are placed on IPFS to ensure tamper evidence and strong provenance. Operational errors and warnings are migrated to the ELK to facilitate indexing and pattern searches during incident triage. The remaining majority of routine informational messages are directed to MySQL to exploit the lower write latency and reduced indexing overhead.
+
+\paragraph{Complexity and Footprint.}
+The static heuristic operates in $O(1)$ time per log (bounded substring membership and set lookups) and maintains no mutable state, making it suitable as (i) a baseline, (ii) a cold-start fallback, and (iii) a teacher policy guiding early exploration in reinforcement learning (see Sec.~\ref{s:rl} if referenced).
+
+\paragraph{Pseudocode.}
+\begin{algorithm}[H]
+\caption{Static Heuristic Routing Policy $\pi_{\text{static}}$}
+\label{alg:static-heuristic}
+\begin{algorithmic}[1]
+\Require log entry $x$ with fields: Level, LogSource, Component, Content
+\Function{Route}{$x$}
+  \State $l \gets \textsc{Normalize}(x.\text{Level})$
+  \State $s \gets \textsc{Normalize}(x.\text{LogSource})$
+  \State $c \gets \textsc{Normalize}(x.\text{Component})$
+  \State $m \gets \textsc{Normalize}(x.\text{Content})$
+  \If{$(s = \texttt{openssh}) \lor (c = \texttt{kernel}) \lor (l \in \{\texttt{crit},\texttt{alert},\texttt{emerg}\})$}
+     \State \Return IPFS
+  \ElsIf{$(l \in \{\texttt{err},\texttt{error},\texttt{warn}\}) \lor (\texttt{fail} \in m) \lor (\texttt{denied} \in m)$}
+     \State \Return ELK
+  \Else
+     \State \Return MySQL
+  \EndIf
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Role in the System.}
+While not an adaptive method, $\pi_{\text{static}}$ supplies: (a) a ceiling for ``zero-learning'' performance, (b) initialization priors for tabular Q-learning states (positive bias toward its chosen action), and (c) a safety fallback when learned artifacts (e.g., PCA + discretizer) are missing or incompatible.
+
+\subsection{Content-Based Routing (CBR)}
+\label{subsec:cbr}
+
+\subsubsection{Bucketed Attribute Statistics}
+\label{subsubsec:cbr-buckets}
+
+The CBR router maintains lightweight, continuously updated empirical cost statistics (latency, energy, or a weighted combination; cf.~\S\ref{subsubsec:cbr-cost}) for a small candidate set of categorical attributes extracted from each log entry to be considered. Let the candidate attribute set be
+\[
+\mathcal{A} = \{\texttt{Level}, \texttt{Component}, \texttt{LogSource}\}.
+\]
+For a log $x$, denote by $a(x)$ the (string) value of attribute $a\in\mathcal{A}$. Each attribute value is mapped into one of $B$ hash buckets as follows:
+\[
+h_a(x) = \big(\mathrm{Hash}(a(x)) \bmod B\big) \in \{0,1,\dots,B-1\}.
+\]
+We store per-(attribute, bucket, backend) samples of an instantaneous routing cost. Let $\mathcal{B}=\{\text{MySQL}, \text{ELK}, \text{IPFS}\}$ and let $c_{a,b,d}$ denote the multiset (list) of observed costs for attribute $a$, bucket $b$, backend $d$. Additionally, global (attribute-agnostic) backend cost lists $g_d$ are accumulated to support early cold-start decisions and fallback rankings.
+
+\paragraph{Sampling.}
+To bound the overhead, only a fraction $p_{\text{sample}}$ of the processed logs are admitted for statistics. For a log $x$ routed to backend $d$ with measured backend latency (or other scalar cost) $C(x,d)$, if the sampling Bernoulli trial succeeds, we:
+\[
+c_{a,\, h_a(x),\, d} \gets c_{a,\, h_a(x),\, d} \cup \{C(x,d)\}, \qquad
+g_d \gets g_d \cup \{C(x,d)\}, \quad \forall a\in\mathcal{A}.
+\]
+
+\paragraph{Empirical Expected Cost.}
+For any non-empty list $S$ of scalar costs, define $\mathrm{mean}(S) = |S|^{-1}\sum_{x\in S} x$. The router periodically derives an expected cost estimate as follows:
+\[
+\widehat{\mu}_{a,b,d} =
+\begin{cases}
+\mathrm{mean}(c_{a,b,d}),\& \text{if } |c_{a,b,d}| > 0,\\
++\infty,\& \text{otherwise},
+\end{cases}
+\]
+cached for a fast lookup during the decision time. The expected global backend means are likewise:
+\[
+\widehat{\mu}_{d}^{\text{global}} =
+\begin{cases}
+\mathrm{mean}(g_d),\& |g_d|>0,\\
++\infty,\& \text{otherwise}.
+\end{cases}
+\]
+
+\paragraph{Data Structures.}
+The implementation uses nested hash maps as follows:
+\[
+\texttt{stats}[a][b][d] \mapsto \texttt{list of float costs}, \qquad
+\texttt{global\_stats}[d] \mapsto \texttt{list of float costs}.
+\]
+The derived means are materialized into a separate cache:
+\[
+\texttt{expected\_latency}[a][(b,d)] = \widehat{\mu}_{a,b,d}.
+\]
+
+\paragraph{Update Trigger.}
+After each admitted sample (or after a fixed decision interval), the structure can be updated incrementally. In practice, the recomputation of attribute scores (selection of a single discriminative attribute) is decoupled and occurs every $T_{\text{recompute}}$ decisions (see \S\ref{subsubsec:cbr-variance}).
+
+\paragraph{Pseudocode (Sampling Hook).}
+\begin{algorithm}[H]
+\caption{CBR Sampling Update (executed with prob.\ $p_{\text{sample}}$)}
+\label{alg:cbr-sample}
+\begin{algorithmic}[1]
+\Require processed log $x$, chosen backend $d$, measured scalar cost $C(x,d)$
+\ForAll{$a \in \mathcal{A}$}
+  \State $b \gets h_a(x)$
+  \State $\texttt{stats}[a][b][d].\textsc{Append}(C(x,d))$
+\EndFor
+\State $\texttt{global\_stats}[d].\textsc{Append}(C(x,d))$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Design Rationale.}
+Hash bucketing amortizes sparse categorical domains (e.g., high-cardinality components) into a fixed-size structure, trading off minor collision-induced noise for a predictable memory. Because the decision time query is $O(|\mathcal{B}|)$ once an attribute is selected, per-log routing remains lightweight, even under continuous adaptation.
+
+\subsubsection{Variance-Reduction Scoring}
+\label{subsubsec:cbr-variance}
+
+After sufficient samples are accumulated, the router selects a single attribute $\hat{a} \in \mathcal{A}$ whose bucket partition best explains (reduces) the variability in the observed routing cost. Let
+\[
+\mathcal{C}_d = g_d \quad\text{be the multiset of all sampled costs for backend } d,
+\]
+and define the aggregated global cost list
+\[
+\mathcal{C}_{\text{all}} = \bigcup_{d \in \mathcal{B}} \mathcal{C}_d.
+\]
+Denote its empirical mean and (population) variance by
+\[
+\mu = \frac{1}{|\mathcal{C}_{\text{all}}|} \sum_{x \in \mathcal{C}_{\text{all}}} x, 
+\qquad
+\sigma^2 = \frac{1}{|\mathcal{C}_{\text{all}}|} \sum_{x \in \mathcal{C}_{\text{all}}} (x - \mu)^2.
+\]
+For a given attribute $a$, each bucket $b$ aggregates all backend-specific samples stored in $\{ c_{a,b,d} \}_{d \in \mathcal{B}}$. Let
+\[
+\mathcal{C}_{a,b} = \bigcup_{d \in \mathcal{B}} c_{a,b,d}, \qquad n_{a,b} = |\mathcal{C}_{a,b}|.
+\]
+The bucket mean and variance are defined as follows:
+\[
+\mu_{a,b} = \frac{1}{n_{a,b}} \sum_{x \in \mathcal{C}_{a,b}} x, \qquad
+\sigma_{a,b}^2 = \frac{1}{n_{a,b}} \sum_{x \in \mathcal{C}_{a,b}} (x - \mu_{a,b})^2,
+\]
+for $n_{a,b} \ge 2$; buckets with $n_{a,b} < 2$ are ignored in the variance aggregation.
+
+The attribute's weighted within-bucket variance is
+\[
+\mathrm{WVar}(a) = \frac{1}{N_a} \sum_{b: n_{a,b} \ge 2} n_{a,b} \,\sigma_{a,b}^2,
+\qquad N_a = \sum_{b: n_{a,b} \ge 2} n_{a,b}.
+\]
+We define a normalized variance reduction score as follows:
+\[
+\mathrm{Score}(a) =
+\begin{cases}
+\displaystyle \max\left(0,\; \frac{\sigma^2 - \mathrm{WVar}(a)}{\sigma^2}\right),\& \text{if } \sigma^2 > 0 \text{ and } N_a \ge n_{\min},\\[8pt]
+0,\& \text{otherwise},
+\end{cases}
+\]
+where $n_{\min}$ (e.g., 5) enforces the minimal support threshold. The selected classifier attribute is
+\[
+\hat{a} = \underset{a \in \mathcal{A}}{\arg\max}\; \mathrm{Score}(a),
+\]
+breaking ties arbitrarily (first encountered). Only one attribute is active at a time to keep online decisions $O(|\mathcal{B}|)$.
+
+\paragraph{Recomputation Interval.}
+Scores are recomputed every $T_{\text{recompute}}$ routing decision (or earlier if no attribute has been chosen and the warm-up sample count $N_{\text{warm}}$ has been met). This balances the responsiveness to drift with stability, preventing oscillations caused by transient local variance dips.
+
+\paragraph{Interpretation.}
+$\mathrm{Score}(a)$ approximates a simple information gain proxy (without entropy) over a continuous cost target: it rewards partitioning that produces tighter (lower-variance) conditional cost distributions than the global distribution. Clamping at zero prevents negative scores when the within-bucket variance unexpectedly exceeds the global variance owing to noise.
+
+\paragraph{Pseudocode (Attribute Scoring).}
+\begin{algorithm}[H]
+\caption{Recompute Attribute Scores}
+\label{alg:cbr-score}
+\begin{algorithmic}[1]
+\Require $\texttt{global\_stats}[d]$ for all $d \in \mathcal{B}$; $\texttt{stats}[a][b][d]$
+\State $\mathcal{C}_{\text{all}} \gets \bigcup_{d} \texttt{global\_stats}[d]$
+\If{$|\mathcal{C}_{\text{all}}| < n_{\min}$} \Return
+\EndIf
+\State Compute $\mu, \sigma^2$
+\ForAll{$a \in \mathcal{A}$}
+   \State Initialize accumulators $T \gets 0$, $S \gets 0$   \Comment{$T$ = total count, $S$ = weighted variance sum}
+   \ForAll{buckets $b$ present for $a$}
+       \State $\mathcal{C}_{a,b} \gets \bigcup_{d} \texttt{stats}[a][b][d]$
+       \If{$|\mathcal{C}_{a,b}| < 2$} \textbf{continue}
+       \EndIf
+       \State Compute $\mu_{a,b}, \sigma_{a,b}^2$
+       \State $T \gets T + |\mathcal{C}_{a,b}|$
+       \State $S \gets S + |\mathcal{C}_{a,b}| \cdot \sigma_{a,b}^2$
+   \EndFor
+   \If{$T < n_{\min}$} \State $\mathrm{Score}(a) \gets 0$; \textbf{continue}
+   \EndIf
+   \State $\mathrm{WVar}(a) \gets S / T$
+   \If{$\sigma^2 > 0$}
+      \State $\mathrm{Score}(a) \gets \max\big(0, (\sigma^2 - \mathrm{WVar}(a)) / \sigma^2\big)$
+   \Else
+      \State $\mathrm{Score}(a) \gets 0$
+   \EndIf
+\EndFor
+\State $\hat{a} \gets \arg\max_a \mathrm{Score}(a)$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity.}
+Let $B$ be the number of buckets and $|\mathcal{A}|$ the attribute count, respectively. Score recomputation is $O(|\mathcal{A}| \cdot B)$ in the worst case (assuming at least one sample per bucket), while per-log routing remains $O(|\mathcal{B}|)$ once $\hat{a}$ is fixed.
+
+\subsubsection{Cost Metrics (Latency / Energy / Combined)}
+\label{subsubsec:cbr-cost}
+
+The CBR router can be optimized for one of three scalar cost formulations when accumulating samples and computing the expected bucket/backend performance: (i) pure latency, (ii) pure energy, or (iii) a weighted combination. Let a processed log routed to backend $d \in \mathcal{B}$ yield an observed backend latency $\ell(x,d)$ (milliseconds) and, when available, CPU package energy $e(x,d)$ (Joules). Missing energy readings (e.g., sensor failure) are treated conservatively by substituting $e(x,d)=0$ in the combined metric and reverting to latency in energy-only mode.
+
+\paragraph{Latency Mode.}
+\[
+C_{\text{lat}}(x,d) = \ell(x,d).
+\]
+
+\paragraph{Energy Mode.}
+\[
+C_{\text{eng}}(x,d) =
+\begin{cases}
+e(x,d),\& \text{if measurement available},\\
+\ell(x,d),\& \text{fallback (no energy reading)}.
+\end{cases}
+\]
+The fallback avoids discarding the sample and preserves monotonicity (higher latency is still penalized).
+
+\paragraph{Combined Mode.}
+To capture joint performance and efficiency, we used an affine combination:
+\[
+C_{\text{comb}}(x,d) = \alpha \,\ell(x,d) + \beta \, e(x,d),
+\]
+with $\alpha > 0$ and $\beta > 0$ user-configurable weights. In the experiments, we set (illustrative example):
+\[
+(\alpha, \beta) = (1.0, 1000.0),
+\]
+giving Joules a larger numeric scaling so that typical sub-second latency magnitudes (tens of ms) and milli-Joule to Joule energy readings contribute comparably (after scaling) to the decision surface. Users can retune $(\alpha,\beta)$ to reflect deployment-specific service-level objectives (SLOs), such as prioritizing eco-efficiency under thermal constraints or emphasizing tail latency during incident response windows.
+
+\paragraph{Normalization Considerations.}
+We deliberately avoid dynamic re-normalization (e.g., z-scoring per window) to keep the interpretation of absolute cost stable across time, which prevents attribute churn driven by shifting baselines. Because the model compares relative means within and across buckets, the multiplicative scaling of all costs leaves the selected attribute invariant.
+
+\paragraph{Metric Selection.}
+The chosen mode determines the scalar $C(x,d)$ inserted into $c_{a,b,d}$ and $g_d$:
+\[
+C(x,d) =
+\begin{cases}
+C_{\text{lat}}(x,d),\& \textsc{mode}=\texttt{latency},\\
+C_{\text{eng}}(x,d),\& \textsc{mode}=\texttt{energy},\\
+C_{\text{comb}}(x,d),\& \textsc{mode}=\texttt{combined}.
+\end{cases}
+\]
+
+\paragraph{Sensitivity.}
+Extremely skewed $(\alpha,\beta)$ choices can collapse discrimination (e.g., if one term numerically dominates all the observed variation). We observed empirically that moderate $\beta$ values preserving a latency contribution stabilize early attribute selection before sufficient energy variance is observed.
+
+\paragraph{Robustness to Missing Data.}
+If energy is sporadically unavailable, the combined mode gracefully degrades toward latency-only rather than dropping samples; the infinite cost sentinel is reserved solely for empty (unseen) bucket/backend combinations during decision time (see fallback chain, \S\ref{subsubsec:cbr-fallback}).
+
+\subsubsection{Cold-Start \& Fallback Chain}
+\label{subsubsec:cbr-fallback}
+
+The CBR router must produce low-overhead and reasonable decisions from the first routed log while progressively improving as evidence accumulates. Therefore, its decision procedure integrates a staged fallback chain coupled with a warm-up phase and periodic re-scoring.
+
+\paragraph{Warm-Up Sampling.}
+No attribute is selected until at least $N_{\text{warm}}$ sampled updates (across all attributes) are ingested:
+\[
+\text{Select attribute only after } \texttt{samples\_collected} \ge N_{\text{warm}}.
+\]
+During this phase, all routed logs still contribute (probabilistically) to the bucketed lists $c_{a,b,d}$ and the global lists $g_d$ (when the Bernoulli sampling succeeds). Attribute scoring (Alg. ~\ref{alg:cbr-score}) is first invoked once the warm-up threshold is reached, and then every $T_{\text{recompute}}$ subsequent decision.
+
+\paragraph{Decision-Time Chain.}
+For an incoming log $x$, the CBR router attempts to make decisions in the following order:
+
+\begin{enumerate}
+  \item \textbf{Attribute-Bucket Decision (if $\hat{a}$ chosen).}  
+    Compute $b = h_{\hat{a}}(x)$ and query cached expected costs 
+    $\widehat{\mu}_{\hat{a},b,d}$ for each backend $d$.  
+    If at least one backend has a finite estimate (i.e., non-empty sample list), pick
+    \[
+    d^\star = \arg\min_{d \in \mathcal{B}} \widehat{\mu}_{\hat{a},b,d}.
+    \]
+  \item \textbf{Global Mean Decision.}  
+    If step 1 fails (all estimates $+\infty$ or no attribute yet), fall back to global backend means $\widehat{\mu}^{\text{global}}_d$ and choose
+    \[
+    d^\star = \arg\min_{d \in \mathcal{B}} \widehat{\mu}^{\text{global}}_d
+    \]
+    among those with at least one global sample included.
+  \item \textbf{Static Heuristic Fallback.}  
+    If neither (1) nor (2) yields a finite choice (e.g., zero samples early or all cost lists empty due to aggressive sampling), delegate to the static rule-based policy $\pi_{\text{static}}$ (Alg. ~\ref{alg:static-heuristic}) to ensure a deterministic and semantically informed route.
+\end{enumerate}
+
+\paragraph{Infinite Sentinel Semantics.}
+The value $+\infty$ is never inserted directly into sample lists; it is only materialized as a placeholder for empty (bucket,backend) pairs during the decision lookup. This avoids conflating unknown costs with large but legitimate measurements.
+
+\paragraph{Edge Cases.}
+\begin{itemize}
+  \item \textbf{Sparse Attribute Support:} If a chosen $\hat{a}$ later exhibits widespread empty buckets (e.g., highly skewed categorical distribution), its bucket-level decisions devolve to frequent global fallbacks. Periodic re-scoring can replace this if another attribute accumulates more discriminative support.
+  \item \textbf{Sampling Probability Too Low:} Very small $p_{\text{sample}}$ increases time to reach $N_{\text{warm}}$, prolonging reliance on the static heuristic. The adaptive tuning of $p_{\text{sample}}$ (future work) could accelerate convergence under bursty workloads.
+  \item \textbf{Concept Drift:} Stale bucket statistics may mis-rank backends if workload characteristics shift abruptly. The fixed $T_{\text{recompute}}$ interval limits the reactivity, and shorter intervals improve adaptation at a higher CPU cost.
+  \item \textbf{Energy-Only Mode Gaps:} If energy instrumentation intermittently fails, combined or latency modes are preferable; pure energy mode with missing readings degenerates to latency (by design) but may distort weighting.
+\end{itemize}
+
+\paragraph{Pseudocode (Decision Procedure).}
+\begin{algorithm}[H]
+\caption{CBR Routing Decision (per log)}
+\label{alg:cbr-decision}
+\begin{algorithmic}[1]
+\Require log $x$
+\If{$\hat{a} \neq \varnothing$}
+   \State $b \gets h_{\hat{a}}(x)$
+   \State $\mathcal{E} \gets \{ (d, \widehat{\mu}_{\hat{a},b,d}) \mid \widehat{\mu}_{\hat{a},b,d} < +\infty \}$
+   \If{$\mathcal{E} \neq \varnothing$}
+       \State \Return $\arg\min_{(d,\mu)\in \mathcal{E}} \mu$
+   \EndIf
+\EndIf
+\State $\mathcal{G} \gets \{ (d, \widehat{\mu}^{\text{global}}_d) \mid \widehat{\mu}^{\text{global}}_d < +\infty \}$
+\If{$\mathcal{G} \neq \varnothing$}
+   \State \Return $\arg\min_{(d,\mu)\in \mathcal{G}} \mu$
+\EndIf
+\State \Return $\pi_{\text{static}}(x)$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Operational Properties.}
+This layered fallback ensures: (i) safety (no undefined states), (ii) monotonic incorporation of empirical evidence, and (iii) bounded per-log computational overhead independent of historical sample volume.
+
+\subsection{Tabular Q-Learning with State Abstraction}
+\label{subsec:qlearning}
+
+We deploy a tabular Q-learning agent to learn a latency/energy-aware routing policy in a high-dimensional observation space derived from each log and the current system state. Raw observations combine (i) a small vector of instantaneous system metrics (CPU load, memory usage, I/O counters, etc.) and (ii) a dense semantic embedding of the log message content. Directly indexing a Q-table by this 774-dimensional continuous vector is infeasible; instead, we apply a three-stage state abstraction pipeline (scaling $\rightarrow$ PCA $\rightarrow$ quantile discretization) to produce a compact discrete state key. The agent maintains:
+\[
+Q: \mathcal{S} \times \mathcal{A} \rightarrow \mathbb{R},
+\]
+where $\mathcal{A} = \{0,1,2\}$ corresponds to \{\texttt{MySQL}, \texttt{ELK}, \texttt{IPFS}\}, and $\mathcal{S}$ is the set of encountered discretized tuples. A teacher (static heuristic) guides early exploration, while adaptive epsilon plateau logic accelerates convergence by scheduling exploration reductions only when reward improvement stalls. Learned artifacts (scaler statistics, PCA model, discretizer, Q-table, and metadata) are versioned to guarantee forward compatibility and safe fallback when schema mismatches occur.
+
+The following subsections detail (i) the state transformation pipeline, (ii) guided exploration with prior initialization, (iii) adaptive epsilon decay with plateau detection, and (iv) artifact versioning and metadata integrity.
+\subsubsection{State Transformation: Scaling $\rightarrow$ PCA $\rightarrow$ Quantile Bins}
+\label{subsubsec:qlearn-state}
+
+Each environment observation is a continuous vector
+\[
+o = [s \,\|\, e] \in \mathbb{R}^{d_s + d_e},
+\]
+where $s \in \mathbb{R}^{d_s}$ is an instantaneous system metric (e.g., CPU load, memory utilization, and I/O counters; $d_s=6$), and $e \in \mathbb{R}^{d_e}$ is a dense embedding of the log content ($d_e=768$). Direct tabular indexing over $\mathbb{R}^{774}$ is infeasible; therefore, we construct a discrete state key via a three-stage pipeline applied once per episode to warm-up samples and then reused for all subsequent steps:
+
+\paragraph{1.\ Standardization.}
+Given a warm-up collection $\{o^{(i)}\}_{i=1}^{N_{\text{warm}}}$ gathered through random exploratory steps, compute the dimension-wise empirical mean and standard deviation as follows:
+\[
+\mu_j = \frac{1}{N_{\text{warm}}} \sum_{i=1}^{N_{\text{warm}}} o^{(i)}_j,
+\qquad
+\sigma_j = \sqrt{\frac{1}{N_{\text{warm}}} \sum_{i=1}^{N_{\text{warm}}} (o^{(i)}_j - \mu_j)^2} + \epsilon,
+\]
+with a small $\epsilon$ (e.g., $10^{-8}$) for numerical stability. Each incoming observation was normalized as follows:
+\[
+\tilde{o}_j = \frac{o_j - \mu_j}{\sigma_j}.
+\]
+
+\paragraph{2.\ Principal Component Analysis (PCA).}
+Apply PCA with $k$ components ($k \ll d_s + d_e$) to the standardized matrix $\tilde{O} \in \mathbb{R}^{N_{\text{warm}} \times (d_s + d_e)}$:
+\[
+z = W_k^\top (\tilde{o} - \bar{0}), \qquad z \in \mathbb{R}^{k},
+\]
+where the rows of $W_k$ are the top $k$ eigenvectors of the empirical covariance of $\tilde{O}$. This concentrates the variance and denoises uninformative embedding dimensions. We deliberately omitted whitening so that downstream binning respects the explained-variance scaling.
+
+\paragraph{3.\ Quantile Discretization.}
+Each PCA component $z_j$ is discretized independently into $B$ ordinal bins using empirical quantile boundaries derived from the projected warm-up set:
+\[
+\text{bin}_j(z_j) = b \quad \text{iff} \quad q_{j,b} \le z_j < q_{j,b+1}, \qquad b \in \{0,\dots,B-1\},
+\]
+where $\{q_{j,b}\}_{b=0}^{B}$ are monotonically increasing quantile cut points with $q_{j,0}=-\infty$ and $q_{j,B}=+\infty$. Quantile (rather than uniform-width) binning balances occupancy, mitigating the curse of dimensional sparsity in early episodes.
+
+\paragraph{Discrete State Key.}
+The final discrete state is the $k$-tuple
+\[
+s_{\text{disc}} = (\text{bin}_1(z_1), \text{bin}_2(z_2), \dots, \text{bin}_k(z_k)) \in \{0,\dots,B-1\}^k,
+\]
+used as a dictionary key in the Q-table:
+\[
+Q[s_{\text{disc}}] \in \mathbb{R}^{|\mathcal{A}|}.
+\]
+
+\paragraph{Warm-Up Data Flow.}
+\begin{enumerate}
+  \item Execute $N_{\text{warm}}$ random actions; buffer observations.
+  \item Fit $(\mu,\sigma)$, PCA($k$), and quantile boundaries $\{q_{j,b}\}$.
+  \item Persist artifacts for later inference episodes (see \S\ref{subsubsec:qlearn-artifacts}).
+\end{enumerate}
+
+\paragraph{Complexity.}
+Let $N=N_{\text{warm}}$ and $D=d_s+d_e$. Standardization is $O(ND)$; PCA via full SVD is $O(ND\min(N,D))$ but $k \ll D$ keeps the runtime acceptable (or incremental solvers could be substituted). Discretization is $O(k \log B)$ per observation (binary search per component), typically $O(k)$ with a direct index lookup after precomputing thresholds.
+
+\paragraph{Collision / Resolution Trade-Off.}
+Smaller $k$ or $B$ reduces state explosion but may conflate distinct operational contexts, larger values improve separability at the cost of sparser visitation and slower convergence. Empirically, a moderate $k$ (e.g., 16) and $B$ (e.g., 12--24) balanced table size and learning speed.
+
+\paragraph{Numerical Stability.}
+All transformations operate in 32-bit floats; adding $\epsilon$ to $\sigma_j$ guards against zero-variance system metrics (e.g., constant I/O counter during warmup).
+
+\subsubsection{Guided Exploration \& Prior Bonus}
+\label{subsubsec:qlearn-guided}
+
+Pure $\epsilon$-greedy exploration over a large discrete abstraction can waste early episodes on uniformly random actions that (i) commit sensitive logs to suboptimal backends and (ii) fail to gather discriminative reward signals. Therefore, we incorporate a \emph{teacher-guided} exploration mechanism using the static heuristic policy $\pi_{\text{static}}$ and a \emph{prior bonus} for newly encountered states.
+
+\paragraph{Action Selection.}
+At each step with the current discretized state $s$:
+\[
+a_t =
+\begin{cases}
+\arg\max_a Q(s,a),\& \text{w.p. } 1-\epsilon_t,\\[4pt]
+\pi_{\text{static}}(x_t),\& \text{w.p. } \epsilon_t \cdot p_{\text{guide}},\\[4pt]
+\text{Uniform}(\mathcal{A}),\& \text{w.p. } \epsilon_t (1-p_{\text{guide}}),
+\end{cases}
+\]
+where $p_{\text{guide}} \in [0,1]$ is the fixed guidance probability (e.g., 0.35). Mapping $\pi_{\text{static}}(x_t)$ (a backend label) to the corresponding action index ensures that a portion of the exploratory steps remains semantically informed.
+
+\paragraph{State Initialization with Prior Bonus.}
+When a successor discretized state $s'$ is first observed, its Q-values are initialized to zero, except for the teacher-chosen action:
+\[
+Q(s', a_{\text{teach}}) \gets Q(s', a_{\text{teach}}) + \delta_{\text{prior}},
+\]
+where $a_{\text{teach}}$ is the action corresponding to $\pi_{\text{static}}(x_{t+1})$ and $\delta_{\text{prior}} > 0$ (e.g., 0.6). This biases early updates toward a plausible baseline while allowing alternative actions to surpass them if they consistently yield higher temporal-difference targets.
+
+\paragraph{Temporal-Difference Update.}
+The standard tabular Q-learning update is applied as follows:
+\[
+Q(s,a) \leftarrow Q(s,a) + \alpha \Big( r_t + \gamma \max_{a'} Q(s',a') - Q(s,a) \Big),
+\]
+with a learning rate $\alpha \in (0,1]$ and discount $\gamma \in [0,1)$.
+
+\paragraph{Benefits.}
+\begin{itemize}
+  \item \textbf{Safety:} Reduces probability of routing high-severity logs to low-integrity backends during early random phases.
+  \item \textbf{Sample Efficiency:} Prior bonus accelerates convergence by avoiding uniformly neutral (all-zero) initial action estimates.
+  \item \textbf{Stability:} Teacher guidance decays organically with $\epsilon_t$; no explicit schedule for $p_{\text{guide}}$ is required.
+\end{itemize}
+
+\paragraph{Ablation Considerations.}
+Disabling guidance ($p_{\text{guide}}=0$) and prior bonus ($\delta_{\text{prior}}=0$) typically increase the number of episodes required to reach a comparable mean reward, especially with larger $k$ or $B$ (sparser state visitation). Excessive $\delta_{\text{prior}}$ can, however, entrench the heuristic and delay discovery of superior energy-latency trade-offs; values in $[0.3,0.8]$ are empirically well-behaved.
+
+\paragraph{Pseudocode (Per Step).}
+\begin{algorithm}[H]
+\caption{Guided Exploration \& Prior Bonus}
+\label{alg:qlearn-guided}
+\begin{algorithmic}[1]
+\Require current state $s$, observation $x_t$, exploration rate $\epsilon_t$, guidance prob.\ $p_{\text{guide}}$
+\State Sample $u \sim \text{Uniform}(0,1)$
+\If{$u < \epsilon_t$}
+   \State Sample $v \sim \text{Uniform}(0,1)$
+   \If{$v < p_{\text{guide}}$}
+       \State $a \gets \text{IndexOf}(\pi_{\text{static}}(x_t))$
+   \Else
+       \State $a \gets \text{UniformAction}()$
+   \EndIf
+\Else
+   \State $a \gets \arg\max_{a'} Q(s,a')$
+\EndIf
+\State Execute $a$, observe reward $r_t$, next observation $x_{t+1}$, compute $s'$
+\If{$s'$ not in $Q$}
+   \State Initialize $Q(s',\cdot) \gets 0$
+   \State $a_{\text{teach}} \gets \text{IndexOf}(\pi_{\text{static}}(x_{t+1}))$
+   \State $Q(s', a_{\text{teach}}) \gets Q(s', a_{\text{teach}}) + \delta_{\text{prior}}$
+\EndIf
+\State $Q(s,a) \gets Q(s,a) + \alpha \big(r_t + \gamma \max_{a'} Q(s',a') - Q(s,a)\big)$
+\State $s \gets s'$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Adaptive Epsilon Plateau Logic}
+\label{subsubsec:qlearn-adaptive-eps}
+
+A static geometric decay $\epsilon_t = \max(\epsilon_{\min}, \epsilon_{t-1}\cdot \lambda)$ risks (i) decaying too rapidly before sufficient state coverage or (ii) lingering at high exploration after the performance has stabilized. We introduce a plateau-responsive scheduler that applies multiplicative drop only when recent learning progress stalls.
+
+\paragraph{Baseline Decay.}
+If enabled, a static factor $\lambda \in (0,1)$ is applied at each step (or episode) unless adaptive logic overrides:
+\[
+\epsilon_t \leftarrow \max(\epsilon_{\min}, \epsilon_{t-1} \cdot \lambda).
+\]
+This can be disabled (command-line flag) to rely exclusively on adaptive reduction.
+
+\paragraph{Episode Reward Tracking.}
+Let $R_t$ be the cumulative reward of episode $t$. Maintain a rolling window of the most recent $W$ episode returns:
+\[
+\bar{R}_t = \frac{1}{W} \sum_{i=t-W+1}^{t} R_i \quad (t \ge W).
+\]
+Track the best (maximum) moving average so far.
+\[
+\bar{R}^{\star}_t = \max(\bar{R}^{\star}_{t-1}, \bar{R}_t).
+\]
+
+\paragraph{Plateau Detection.}
+A plateau counter increments when:
+\[
+\bar{R}_t \le \bar{R}^{\star}_{t-1} + \delta_{\text{tol}},
+\]
+meaning no improvement above a small tolerance $\delta_{\text{tol}} \ge 0$. After $P$ consecutive non-improvements (patience), an adaptive decay event is triggered:
+\[
+\epsilon_t \leftarrow \max(\epsilon_{\min}, \epsilon_t \cdot \rho),
+\]
+with an adaptive drop factor $\rho \in (0,1)$ (e.g., 0.7), and then reset the plateau counter to zero.
+
+\paragraph{Activation Threshold.}
+Adaptive scheduling is inert until at least $E_{\min}$ episodes have elapsed to avoid misclassifying the volatile early reward trajectory as a stagnation.
+
+\paragraph{Algorithmic Outline.}
+\begin{algorithm}[H]
+\caption{Adaptive Epsilon Plateau Scheduler (per episode end)}
+\label{alg:qlearn-eps}
+\begin{algorithmic}[1]
+\Require episode index $t$, episode return $R_t$, params $(W, P, \rho, E_{\min}, \delta_{\text{tol}})$
+\State Append $R_t$ to window buffer (evict oldest if size $> W$)
+\If{$t < E_{\min}$} \State \Return
+\EndIf
+\If{window not full ($<W$)} \State \Return
+\EndIf
+\State $\bar{R}_t \gets \text{Mean}(\text{window})$
+\If{$\bar{R}_t > \bar{R}^{\star} + \delta_{\text{tol}}$}
+   \State $\bar{R}^{\star} \gets \bar{R}_t$; $\text{plateau\_count} \gets 0$
+\Else
+   \State $\text{plateau\_count} \gets \text{plateau\_count} + 1$
+   \If{$\text{plateau\_count} \ge P$}
+       \State $\epsilon \gets \max(\epsilon_{\min}, \epsilon \cdot \rho)$
+       \State Record adaptive event $(t, \epsilon)$
+       \State $\text{plateau\_count} \gets 0$
+   \EndIf
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Event Logging.}
+Each adaptive decay was appended to an NDJSON stream (episode, new epsilon) for post-hoc analysis and reproducibility. This log is also mirrored in the metadata (see \S\ref{subsubsec:qlearn-artifacts}) when episodes $\le$ a configured threshold; otherwise, only summary statistics (final epsilon, best moving average) are embedded.
+
+\paragraph{Parameter Effects.}
+\begin{itemize}
+  \item Larger $W$ smooths noise but delays responsiveness.
+  \item Higher $P$ increases confidence in stagnation at the cost of slower exploitation shift.
+  \item Smaller $\rho$ (stronger drop) accelerates convergence risked at potential premature exploitation.
+  \item Non-zero $\delta_{\text{tol}}$ avoids reacting to floating-point jitters.
+\end{itemize}
+
+\paragraph{Convergence Behavior.}
+Once $\epsilon$ hits $\epsilon_{\min}$, further plateaus produce no effect; the agent is effectively greedy thereafter (aside from tie-breaking randomness in $\arg\max$). This avoids repeated diminutions, yielding negligible policy changes.
+
+\subsubsection{Artifact Versioning \& Metadata}
+\label{subsubsec:qlearn-artifacts}
+
+The robust reuse of trained Q-learning policies across code revisions and feature-space changes requires explicit artifact versioning and compatibility validation. Each training run produces a bundle of serialized components sharing a common filename prefix $\Pi$ (e.g., \texttt{trained\_models/q\_learning}):
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\caption{Saved model artifact files}
+\label{tab:model-artifacts}
+\begin{tabularx}{\linewidth}{@{}l X@{}}
+\toprule
+\textbf{Suffix} & \textbf{Content} \\
+\midrule
+\texttt{\_q\_table.pkl}   & Python dict: $s_{\text{disc}} \mapsto \mathbb{R}^{|\mathcal{A}|}$ Q-values \\
+\texttt{\_scaler.pkl}     & Dict with $\mu, \sigma$ (float32 arrays) for z-score normalization \\
+\texttt{\_pca.pkl}        & Fitted PCA transformer (components, explained variance) \\
+\texttt{\_binner.pkl}     & KBinsDiscretizer with quantile thresholds per component \\
+\texttt{\_metadata.json}  & JSON metadata: structural + training provenance fields \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+
+\paragraph{Metadata Schema (Version 3).}
+{\scriptsize
+\begin{verbatim}
+{
+  "version": 3,
+  "timestamp": <unix_epoch>,
+  "obs_dim": 774,
+  "embedding_dim": 768,
+  "pca_components": k,
+  "n_bins": B,
+  "episodes": E,
+  "alpha": <learning_rate>,
+  "gamma": <discount>,
+  "eps_start": ...,
+  "eps_end": ...,
+  "eps_decay": ...,
+  "guided_prob": p_guide,
+  "prior_bonus": delta_prior,
+  "adaptive_eps_window": W,
+  "adaptive_eps_patience": P,
+  "adaptive_eps_drop": rho,
+  "adaptive_eps_min_episodes": E_min,
+  "disable_static_eps_decay": <bool>,
+  "adaptive_events": [ {"episode": e, "epsilon": val}, ... ],
+  "final_epsilon": <float>,
+  "best_recent_avg": <float>,
+  "reward_mean": <float>,
+  "reward_median": <float>,
+  "reward_std": <float>,
+  "reward_min": <float>,
+  "reward_max": <float>,
+  "episode_rewards": [ ... ]    // only if E <= reward_history_inline_threshold
+}
+\end{verbatim}
+}
+\paragraph{Inline Reward Policy.}
+To prevent excessive JSON size for long runs, full \texttt{episode\_rewards} are embedded only when $E \le T_{\text{inline}}$ (a configurable threshold). Otherwise, a CSV file (if requested) captures the per-episode trajectory, and the metadata retains only summary statistics + adaptive events.
+
+\paragraph{Loading \& Validation.}
+At inference time, the router performs the following:
+\begin{enumerate}
+  \item Load metadata; verify supported \texttt{version} (warn if $>$ current).
+  \item Load scaler ($\mu,\sigma$) and check $\texttt{obs\_dim}$ matches vector length produced by current feature extractor. Mismatch $\Rightarrow$ invalidates all learned transforms.
+  \item Apply PCA + binning; if any transformer missing or incompatible, revert to static heuristic for all decisions (fail-safe).
+  \item During routing: discretize state; if $s_{\text{disc}} \notin Q$ use fallback heuristic (teacher) action.
+\end{enumerate}
+
+\paragraph{Failure Modes and Safeguards.}
+\begin{itemize}
+  \item \textbf{Dimension Drift:} Changes to embedding model altering $d_e$ cause \texttt{obs\_dim} mismatch; system prints a warning and disables learned artifacts instead of producing misaligned projections.
+  \item \textbf{Corrupt Scaler/PCA/Binner:} Exceptions during deserialization trigger a downgrade path (StaticRouter).
+  \item \textbf{Forward Version Skew:} If metadata version $v_{\text{artifact}} > v_{\text{supported}}$, a best-effort load proceeds with a compatibility warning (fields not recognized are ignored).
+\end{itemize}
+
+\paragraph{Deterministic Reproducibility.}
+Given identical (i) warm-up observation sequences, (ii) hyperparameters, and (iii) RNG seeds, the serialized artifacts are deterministic. Embedding changes, altered sampling order, or system metric variability break bitwise equality, but not conceptual reproducibility (policy performance remains similar).
+
+\paragraph{Provenance Extension (Optional Future Fields).}
+Possible future additions include git commit hash, host hardware signature (CPU model, core count), cumulative training wall-clock time, and energy consumption during training episodes (for sustainability reporting).
+
+\paragraph{Integrity vs. Mutability.}
+The Q-table is mutable during training but immutable in the evaluation mode. Metadata encodes the training-time adaptive epsilon events, enabling the retrospective analysis of exploration scheduling without parsing reward logs.
+
+\subsection{Advantage Actor-Critic (A2C)}
+\label{subsec:a2c}
+
+We employed an Advantage Actor-Critic (A2C) agent to learn a stochastic routing policy over the same continuous observation space used by the Q-learning setup (system metrics + semantic embedding). Unlike the tabular method, A2C directly optimizes a parameterized policy $\pi_{\theta}(a \mid o)$ and a value function $V_{\phi}(o)$ using on-policy rollouts of a fixed horizon $n$ (``$n$-step returns''). This enables generalization across unvisited observation regions and smoother adaptation under continuous feature shifts. The implementation builds on Stable-Baselines3 with extensions for (i) optional observation scaler warm-up, (ii) linear learning rate decay, (iii) entropy coefficient annealing, (iv) periodic evaluation for best-model selection, and (v) structured metadata + scaler artifact persistence.
+
+The subsequent subsections detail (i) the network architecture and loss decomposition, (ii) entropy  and learning rate schedules, (iii) the observation scaler warm-up phase, and (iv) checkpointing with best-evaluation model retention.
+\subsubsection{Network Architecture}
+\label{subsubsec:a2c-architecture}
+
+The actor-critic model consumes the continuous observation vector
+\[
+o = [s \,\|\, e] \in \mathbb{R}^{d_s + d_e} \quad (d_s=6,\; d_e=768,\; \text{total}=774)
+\]
+optionally standardized by a z-score scaler (see \S\ref{subsubsec:a2c-scaler}). A shared multilayer perceptron (MLP) extracts a latent representation that feeds two task-specific heads: a policy (actor) that produces a categorical distribution over backends and a value (critic) that estimates the state value.
+
+\paragraph{Shared Trunk.}
+Let the hidden layer widths be $(h_1, h_2, \dots, h_L)$. The trunk computes
+\[
+z^{(0)} = o,\qquad
+z^{(\ell)} = \sigma\!\big(W^{(\ell)} z^{(\ell-1)} + b^{(\ell)}\big), \quad \ell=1\dots L,
+\]
+with nonlinearity $\sigma$ = ReLU. The final shared embedding $z^{(L)}$ (dimension $h_L$) is passed to the two heads. Parameter tying encourages coordinated feature reuse between the policy and value estimation.
+
+\paragraph{Actor Head.}
+\[
+\pi_{\theta}(a \mid o) = \text{Softmax}\big(W^{(\pi)} z^{(L)} + b^{(\pi)}\big), \qquad a \in \{0,1,2\}.
+\]
+This yields a categorical distribution over actions mapping to \{\texttt{MySQL}, \texttt{ELK}, \texttt{IPFS}\}. Sampling during training enables exploration; in evaluation, we use $\arg\max$ (deterministic) unless stochastic analysis is desired.
+
+\paragraph{Critic Head.}
+\[
+V_{\phi}(o) = W^{(V)} z^{(L)} + b^{(V)} \in \mathbb{R}.
+\]
+The scalar baseline reduces the policy gradient variance.
+
+\paragraph{Rollout and Returns.}
+For $n$-step on-policy rollouts (horizon $n$) we collect transitions
+$(o_t, a_t, r_t, o_{t+1})$ and bootstrap with $V_{\phi}(o_{t+n})$ to form returns:
+\[
+G_t^{(n)} = \sum_{i=0}^{n-1} \gamma^{i} r_{t+i} + \gamma^{n} V_{\phi}(o_{t+n}),
+\]
+(Terminal states zero out the bootstrap term.) The empirical advantage estimate is as follows:
+\[
+\hat{A}_t = G_t^{(n)} - V_{\phi}(o_t).
+\]
+
+\paragraph{Loss Components.}
+Total loss:
+\[
+\mathcal{L} = \mathcal{L}_{\text{policy}} + c_v \mathcal{L}_{\text{value}} - c_e \mathcal{H}[\pi_{\theta}(\cdot \mid o)],
+\]
+where (minimization convention):
+\[
+\mathcal{L}_{\text{policy}} = - \mathbb{E}_t \big[ \log \pi_{\theta}(a_t \mid o_t)\, \hat{A}_t^{\text{stop}}\big], \qquad
+\mathcal{L}_{\text{value}} = \mathbb{E}_t \big[ (G_t^{(n)} - V_{\phi}(o_t))^2 \big],
+\]
+and $\mathcal{H}$ is the categorical entropy that encourages exploration. The coefficients $c_v$ (value loss weight) and $c_e$ (entropy coefficient) map to CLI flags \texttt{--vf\_coef} and \texttt{--ent\_coef}.
+
+\paragraph{Gradient Flow.}
+The advantage term is typically detached (stop-gradient) to prevent second-order interactions through $V_{\phi}$ in $\mathcal{L}_{\text{policy}}$. Both heads backpropagate into a shared trunk.
+
+\paragraph{Regularization and Stability.}
+We rely on:
+\begin{itemize}
+  \item Entropy bonus (annealed optionally) to prevent premature collapse.
+  \item Linear learning rate decay for smoother late-stage convergence (see \S\ref{subsubsec:a2c-schedules}).
+  \item Optional observation normalization to reduce scale-induced gradient spikes.
+\end{itemize}
+
+\paragraph{Complexity.}
+Per update: forward/backward cost $O\!\Big(\sum_{\ell=1}^{L} h_{\ell-1} h_{\ell}\Big)$ per batch element, with small $L$ (1--3 layers) keeping training lightweight relative to environment interaction.
+
+\paragraph{Pseudocode (Simplified A2C Update).}
+\begin{algorithm}[H]
+\caption{A2C Update (single rollout)}
+\label{alg:a2c-update}
+\begin{algorithmic}[1]
+\Require horizon $n$, discount $\gamma$, coeffs $c_v, c_e$
+\State Collect $(o_t,a_t,r_t)$ for $t=0\dots n-1$, record $o_n$
+\State $R \gets V_{\phi}(o_n)$  (0 if terminal)
+\For{$t = n-1$ down to $0$}
+   \State $R \gets r_t + \gamma R$
+   \State $G_t \gets R$
+\EndFor
+\State $\hat{A}_t \gets G_t - V_{\phi}(o_t)$
+\State $\mathcal{L}_{\text{policy}} \gets -\frac{1}{n}\sum_t \log \pi_{\theta}(a_t|o_t)\, \text{stop}(\hat{A}_t)$
+\State $\mathcal{L}_{\text{value}} \gets \frac{1}{n}\sum_t (G_t - V_{\phi}(o_t))^2$
+\State $\mathcal{H} \gets \frac{1}{n}\sum_t \text{Entropy}(\pi_{\theta}(\cdot|o_t))$
+\State $\mathcal{L} \gets \mathcal{L}_{\text{policy}} + c_v \mathcal{L}_{\text{value}} - c_e \mathcal{H}$
+\State Update $\theta,\phi$ via Adam/SGD on $\nabla \mathcal{L}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Entropy Regularization and Learning Rate Schedules}
+
+To stabilize policy improvement and avoid premature convergence to a narrow routing distribution, we incorporate (i) an optional entropy coefficient annealing schedule and (ii) an optional linear decay of the optimizer’s learning rate. Both schedules were explicitly parameterized and persisted in the metadata artifact for reproducibility.
+
+\paragraph{Entropy Bonus.}
+Given the policy $\pi_\theta(a \mid s)$ over the discrete backend action set $\mathcal{A} = \{\text{MySQL}, \text{ELK}, \text{IPFS}\}$, the (per-state) categorical entropy is
+\[
+H\big(\pi_\theta(\cdot \mid s)\big) \;=\; - \sum_{a \in \mathcal{A}} \pi_\theta(a \mid s)\,\log \pi_\theta(a \mid s).
+\]
+The standard A2C objective augments the advantage-weighted policy gradient with an entropy term scaled by a coefficient $c_t$:
+\[
+\mathcal{L}_{\text{policy}} = - \mathbb{E}_{(s,a)\sim \pi_\theta}\big[ \log \pi_\theta(a \mid s)\, \hat{A}(s,a) \big] \;-\; c_t \, \mathbb{E}_{s}\big[ H(\pi_\theta(\cdot \mid s)) \big].
+\]
+A larger $c_t$ encourages broader exploration (higher uncertainty tolerance), while $c_t \to 0$ shifts the focus toward pure exploitation.
+
+\paragraph{Entropy Coefficient Annealing.}
+When enabled (CLI flag \texttt{--ent\_anneal}), $c_t$ is linearly interpolated from an initial value $c_0$ (the user-specified \texttt{--ent\_coef}) to a target $c_\ast$ (flag \texttt{--ent\_target}) over a user-defined step horizon $T_{\text{ent}}$ (flag \texttt{--ent\_anneal\_steps}). Let $t$ be the cumulative number of environment steps elapsed (clamped to $T_{\text{ent}}$):
+\[
+c_t \;=\; 
+\begin{cases}
+c_0 \;+\; (c_\ast - c_0)\,\dfrac{t}{T_{\text{ent}}},\& 0 \le t < T_{\text{ent}},\\[6pt]
+c_\ast,\& t \ge T_{\text{ent}}.
+\end{cases}
+\]
+This schedule covers both decay $(c_\ast < c_0)$ and ramp-up $(c_\ast > c_0)$ scenarios, respectively. Decay is typical: begin with higher entropy pressure to diversify early routing decisions across backends, then reduce exploration after sufficient coverage of the state space.
+
+\paragraph{Learning Rate Linear Decay.}
+With the optional flag \texttt{--lr\_linear\_decay}, the optimizer learning rate $\alpha_t$ (initial $\alpha_0$ from \texttt{--learning\_rate}) is linearly decayed to zero over the total planned training horizon $T_{\text{train}}$ (flag \texttt{--timesteps}):
+\[
+\alpha_t \;=\; \alpha_0 \left( 1 - \frac{t}{T_{\text{train}}} \right)_{+}
+\quad\text{where}\quad (x)_{+} = \max(0, x).
+\]
+Thus, $\alpha_t$ decreases monotonically, reaching (or approaching) $0$ as $t \to T_{\text{train}}$, dampening late-stage parameter oscillations and reducing overfitting to transient workload fluctuations.
+
+\paragraph{Joint Schedule Interaction.}
+Entropy annealing and LR decay are orthogonal; disabling one leaves the other unaffected. The combined effect is:
+\begin{itemize}
+  \item Early training: relatively larger $(\alpha_t, c_t)$ fosters both parameter space mobility and policy distributional diversity.
+  \item Mid training: gradual reduction curbs variance while still allowing moderate exploration.
+  \item Late training: small $\alpha_t$ stabilizes convergence; $c_t$ at (decayed) $c_\ast$ limits unnecessary exploration cost.
+\end{itemize}
+
+\paragraph{Practical Considerations.}
+\begin{itemize}
+  \item If $c_0 = c_\ast$ or $T_{\text{ent}} = 0$, annealing degenerates to a constant entropy weight.
+  \item Aggressive decay (large $(c_0 - c_\ast)$ over small $T_{\text{ent}}$) can induce premature policy collapse onto a single backend.
+  \item Setting $c_\ast > c_0$ (ramp-up) can diffuse strong prior biases (rarely required in our experiments).
+  \item Linear LR decay chosen for transparency; more complex schedules (cosine, polynomial) were unnecessary.
+\end{itemize}
+
+\paragraph{Metadata Persistence.}
+The final artifact metadata records
+\[
+(c_0, c_\ast, T_{\text{ent}}, c_{T_{\text{ent}}}, \alpha_0, \alpha_{T_{\text{train}}})
+\]
+as \texttt{ent\_coef}, \texttt{ent\_target}, \texttt{ent\_anneal\_steps}, \texttt{final\_ent\_coef}, \texttt{learning\_rate}, \texttt{final\_learning\_rate}, ensuring downstream reproducibility and compatibility checks.
+
+\subsubsection{Observation Scaler Warm-up}
+
+High-variance feature magnitudes (particularly the 768-dimensional semantic embedding component versus lower-scale system metrics) can slow the convergence and bias early gradient steps. To mitigate this, we optionally perform a pre-training ``scaler warm-up'' phase, collecting a fixed number of raw observations before enabling gradient updates.
+
+\paragraph{Warm-up Collection.}
+Let $W$ denote the configured warm-up size (CLI flag \texttt{--scaler\_warmup}; $W=0$ disables this procedure). For the first $W$ environment steps, we
+\[
+\text{Accumulate } \mathbf{o}_t \in \mathbb{R}^d \quad (t = 1,\dots,W), \qquad d = \text{observation dimension (e.g., } 774\text{)}.
+\]
+No policy/value updates are applied during this accumulation window (rollouts are ignored for learning; actions are still sampled from the unscaled policy parameters initialized with standard weight initialization).
+
+\paragraph{Z-Score Statistics.}
+After $W$ samples:
+\[
+\boldsymbol{\mu} = \frac{1}{W}\sum_{t=1}^{W} \mathbf{o}_t, 
+\qquad
+\boldsymbol{\sigma} = \sqrt{\frac{1}{W}\sum_{t=1}^{W} (\mathbf{o}_t - \boldsymbol{\mu})^{\odot 2} + \varepsilon},
+\]
+with a small $\varepsilon$ (e.g., $10^{-8}$) for numerical stability. We persist $(\boldsymbol{\mu}, \boldsymbol{\sigma})$ as a dictionary in a \texttt{\_scaler.pkl} artifact (float32 arrays) and record a boolean flag \texttt{scaler\_present=true} plus $W$ in the metadata.
+
+\paragraph{Online Application.}
+For all subsequent steps $t > W$ the environment observation $\mathbf{o}_t$ is transformed as follows:
+\[
+\tilde{\mathbf{o}}_t = \frac{\mathbf{o}_t - \boldsymbol{\mu}}{\boldsymbol{\sigma}}.
+\]
+Only the scaled $\tilde{\mathbf{o}}_t$ is fed into the policy/value networks; the original $\mathbf{o}_t$ is discarded for the gradient computations. This normalizes disparate feature ranges (e.g., latency counters vs. embedding float magnitudes), typically improving the conditioning of the loss landscape.
+
+\paragraph{Edge Cases and Compatibility.}
+\begin{itemize}
+\item If $W = 0$ or fewer than $W$ steps are collected due to early termination, scaling is skipped and \texttt{scaler\_present=false}.
+\item At inference time, if a scaler artifact is present, the router applies the same transformation; a mismatch in expected dimension $d$ triggers a safe fallback (the raw observation is used without scaling).
+\item We do not update $(\boldsymbol{\mu}, \boldsymbol{\sigma})$ online after initialization to preserve determinism and align with the frozen evaluation protocol.
+\end{itemize}
+
+\paragraph{Rationale.}
+Empirically, early unscaled updates can overweight large-magnitude embedding coordinates, slowing the integration of lower-scale system metrics (e.g., instantaneous queue length and recent latency deltas). A one-shot fixed scaler avoids distributional drift complications while delivering most of the stabilizing benefits of full running normalization.
+
+\paragraph{Metadata.}
+The JSON metadata stores:
+\[
+(d, W, \texttt{scaler\_present}, \texttt{embedding\_dim})
+\]
+This enables downstream validation (e.g., rejecting reuse if the embedding backbone changes dimension).
+\subsubsection{Checkpointing \& Best Model Selection}
+
+Robust experimentation requires (i) periodic persistence of the intermediate training state to guard against interruption and (ii) selection of a performance-optimal (not merely the last) policy for downstream evaluation. We implemented a lightweight dual mechanism: fixed-interval checkpointing and evaluation-driven best model retention.
+
+\paragraph{Periodic Checkpoints.}
+Let $C$ be the (optional) checkpoint interval in environment steps (CLI flag \texttt{--checkpoint\_interval}; $C=0$ or unset disabled). At the cumulative step count $t$, if $t \bmod C = 0$, we serialized the full Stable-Baselines3 policy (weights + optimizer state) to:
+\[
+\texttt{<base>}\_\texttt{ckpt\_}t\texttt{.zip}.
+\]
+All checkpoints are versioned by the exact step index $t$ enabling chronological reconstruction. The metadata fields record $C$ and the total number of emitted checkpoints.
+
+\paragraph{Evaluation Scheduling.}
+Independently, every $E$ steps (flag \texttt{--eval\_interval}; $E = 0$ disables evaluation), we run $N_{\text{eval}}$ evaluation episodes (flag \texttt{--eval\_episodes}, default $5$) with learning disabled. Let the mean episode return at evaluation event $k$ be $\bar{R}_k$. The sequence $\{\bar{R}_k\}$ is tracked online.
+
+\paragraph{Best Model Criterion.}
+A model is considered strictly better if $\bar{R}_k > \bar{R}_{\text{best}} + \delta$, where $\bar{R}_{\text{best}}$ is the highest previously observed mean return and $\delta \ge 0$ is an (implicit) improvement threshold (we use $\delta=0$; ties do not trigger overwrite). For improvement, we persist a copy of the current policy to:
+\[
+\texttt{<base>}\_\texttt{best.zip}.
+\]
+The metadata stores $\bar{R}_{\text{best}}$ as \texttt{eval\_best\_mean\_reward} plus the step index $t_{\text{best}}$ at which it was achieved.
+
+\paragraph{Lossless Separation.}
+Regular checkpoints (ckpt) and the best snapshot are decoupled: the best model file always points to the globally highest-performing policy (per evaluation protocol), regardless of later regressions or further checkpoints. This prevents the overwriting of a superior earlier policy by a degraded late-stage model.
+
+\paragraph{Interruption Recovery.}
+In the case of premature termination at step $t^\prime$, one can resume from the largest $t \le t^\prime$ checkpoint file. Because the learning rate decay and entropy annealing are deterministic functions of the absolute step count $t$, the resumption must also restore $t$ (retained inside the SB3 replay of rollout buffer counters) to maintain the schedule continuity.
+
+\paragraph{Complexity and Storage.}
+The checkpointing cost is $O(P)$ in parameter count $P$ per emission (simple serialization); the evaluation cost is $O(N_{\text{eval}}\cdot L)$ where $L$ is the average episode length (here, effectively the number of logs processed per evaluation batch). Empirically, evaluation dominates overhead; thus, users can:
+\begin{itemize}
+  \item Increase $E$ (less frequent evaluation) to reduce runtime overhead.
+  \item Set $C > E$ if only a sparse subset of evaluation events require resilient persistence.
+  \item Disable checkpoints ($C=0$) while retaining best model selection if disk space is constrained.
+\end{itemize}
+
+\paragraph{Metadata Persistence.}
+Artifact metadata include:
+\[
+(C, \text{num\_checkpoints}, E, N_{\text{eval}}, \bar{R}_{\text{best}}, t_{\text{best}})
+\]
+mirroring \texttt{checkpoint\_interval}, \texttt{num\_checkpoints}, \texttt{eval\_interval}, \texttt{eval\_episodes}, \texttt{eval\_best\_mean\_reward}, and the (optional) step of the best model. This guarantees the reproducibility of the selection process.
+
+\paragraph{Rationale.}
+Separating concerns (periodic durability vs. performance-optimal snapshot) avoids conflating recency with quality and aligns with experimental reporting norms, where evaluation references the best-validated policy rather than the terminal weights.
+
+
+\subsection{Compliance Enforcement Layer (Hard Override)}\label{s:compliance-layer}
+
+Operational environments handling mixed-sensitivity telemetry often require \emph{non-negotiable} guarantees that security- or privacy-relevant records persist durably in an immutable audit trail. To meet this requirement, we introduce a thin, deterministic \emph{Compliance Enforcement Layer} that wraps any routing policy (static, CBR, Q-learning, A2C, or future methods) and enforces a hard override to the IPFS backend whenever a log entry matches a configurable set of sensitive textual patterns. This layer is deliberately orthogonal to learning; it neither alters rewards nor injects gradients; instead, it post-processes proposed actions at inference time, ensuring invariant coverage, irrespective of exploration or exploitation dynamics.
+
+\subsubsection{Sensitive Pattern Detection}\label{s:compliance-pattern-detection}
+
+Let $\mathcal{P} = \{p_1, \dots, p_m\}$ be a (small) set of user- and system-defined case-insensitive substring patterns (defaults include tokens such as \texttt{``sessionid''}, \texttt{``token''}, \texttt{``secret key''}, \texttt{``permission denied''}, \texttt{``login''}, and path fragments like \texttt{``/home/''}). For each incoming log with raw message text $T$, we classify it as sensitive if
+\[
+\exists p \in \mathcal{P}:\; p \text{ is a substring of } \text{lowercase}(T).
+\]
+This yields a binary predicate
+\[
+\texttt{is\_sensitive}(T) =
+\begin{cases}
+1\& \text{if match found},\\
+0\& \text{otherwise}.
+\end{cases}
+\]
+The pattern set can be extended at runtime: $\mathcal{P} \leftarrow \mathcal{P} \cup \mathcal{P}_{\text{user}}$, where $\mathcal{P}_{\text{user}}$ is supplied via CLI. Because detection is a simple substring search, its complexity is $O(|T| \cdot m)$ in the naive form; given small $m$, the overhead is negligible relative to embedding extraction and backend I/O. This choice favors explainability over heavier natural language processing (NLP) or regular expression (regex) pipelines.
+
+\subsubsection{Override Semantics \& Metrics (Coverage, Leakage)}\label{s:compliance-metrics}
+
+Let $a_{\text{raw}} \in \mathcal{A} = \{\text{MySQL}, \text{ELK}, \text{IPFS}\}$ be the backend proposed by the underlying router for log $i$, and $S_i = \texttt{is\_sensitive}(T_i)$. The enforced destination $a_i$ is
+\[
+a_i =
+\begin{cases}
+\text{IPFS},\& S_i = 1,\\
+a_{\text{raw}},\& S_i = 0.
+\end{cases}
+\]
+We record a modification flag
+\[
+\texttt{compliance\_forced}_i = \mathbb{1}[S_i = 1 \land a_{\text{raw}} \neq \text{IPFS}],
+\]
+and retains $a_{\text{raw}}$ for audit trails. Over $N$ logs:
+\[
+N_{\text{s}} = \sum_{i=1}^{N} S_i,\qquad
+N_{\text{s}\rightarrow \text{IPFS}} = \sum_{i=1}^{N} \mathbb{1}[S_i = 1 \land a_i = \text{IPFS}],
+\]
+\[
+\text{Coverage} \;=\; \frac{N_{\text{s}\rightarrow \text{IPFS}}}{N_{\text{s}}}, \qquad
+\text{Leakage} \;=\; N_{\text{s}} - N_{\text{s}\rightarrow \text{IPFS}}.
+\]
+Leakage rate: $\text{LeakageRate} = \text{Leakage}/N_{\text{s}}$ (defined $0$ if $N_{\text{s}}=0$). Binary compliance score
+\[
+\text{ComplianceScore} =
+\begin{cases}
+1.0,\& \text{Leakage}=0,\\
+0.0,\& \text{otherwise}.
+\end{cases}
+\]
+Collateral immutable usage (cost/energy signal)
+\[
+\text{NonSensitiveIPFSFrac} = \frac{\sum_{i=1}^{N} \mathbb{1}[S_i = 0 \land a_i = \text{IPFS}]}{\max(1, N - N_{\text{s}})}.
+\]
+All are reported in cross-router summaries, enabling fair comparisons under enforced compliance.
+
+\paragraph{Rationale.}
+Coverage and leakage quantitatively separate surface governance effectiveness from routing intelligence. Any leakage ($>0$) is a configuration or pattern gap, not a learning failure.
+
+\subsubsection{Separation from Policy Learning}\label{s:compliance-separation}
+
+The layer defines an externally enforced transformed policy
+\[
+\pi'(a \mid s, T) =
+\begin{cases}
+\mathbb{1}[a = \text{IPFS}],\& \text{if } \texttt{is\_sensitive}(T)=1,\\
+\pi(a \mid s),\& \text{otherwise,}
+\end{cases}
+\]
+where $\pi$ is the underlying (possibly learned) router. During the training of adaptive methods:
+\begin{enumerate}
+  \item Rewards are computed using $a_{\text{raw}}$ (pre-override) to avoid biasing exploration toward IPFS merely due to compliance.
+  \item The hard override applies only at evaluation / deployment emission time.
+  \item Both $a_{\text{raw}}$ and final $a_i$ are logged, preserving the unperturbed policy trajectory for analysis.
+\end{enumerate}
+This strict separation prevents reward hacking and maintains a clear boundary between normative governance logic and performance and energy optimization. Future variants could add penalty shaping for near-misses; however, we intentionally excluded such coupling to maintain reproducibility and make the interpretation more straightforward.
+
+\paragraph{Failure Modes \& Extensibility.}
+False negatives degrade coverage; mitigation paths include expanding $\mathcal{P}$, Unicode normalization, or selective regexes. False positives inflated the NonSensitiveIPFSFrac (conservative bias). The mechanism is backend-agnostic: extending $\mathcal{A}$ leaves the enforcement semantics unchanged (all sensitive traffic still collapses to IPFS).
+
+\paragraph{Summary.}
+The Compliance Enforcement Layer guarantees immutability for sensitive logs, provides auditable governance metrics (coverage, leakage, collateral IPFS usage), and remains modular, enabling the independent evolution of both detection heuristics and adaptive routing policies.
+
+\section{Energy \& Performance Measurement}
+\label{s:energy-measurement}
+
+\subsection{RAPL-Based Energy Acquisition}
+\label{s:rapl-acquisition}
+We obtained fine-grained CPU energy measurements using Intel's Running Average Power Limit (RAPL) interface, which exposes model-specific registers (MSRs) that aggregate package-level energy consumption. At decision time $t$ (one log routing + backend write), we read the package energy counter $E_{\text{pkg}}$ (joules) immediately before issuing the backend operation and again after completion, forming a differential as follows:
+\[
+\Delta E_t = E_{\text{pkg}}^{\text{after}} - E_{\text{pkg}}^{\text{before}}.
+\]
+RAPL counters monotonically increase with a hardware-defined wraparound; in our runs, the counter width (typically 32 or 48 bits) and total duration ensured no overflow. If a wrap is detected (negative raw delta), we ignore the sample for energy statistics and mark the log with an energy validity flag.
+
+Access occurs via the Linux sysfs interface (e.g., \texttt{/sys/class/powercap/intel-rapl:0/energy\_uj}) or fallback MSR read, yielding microjoules, which we convert to joules by scaling $10^{-6}$. Each routing decision thus yields a $(\text{latency}_t, \Delta E_t)$ pair without additional synchronization: energy reads are low overhead ($<5\mu s$) relative to the backend I/O latency (ms scale). When RAPL is unavailable (non-Intel architectures or restricted environment), the system records $\Delta E_t = 0$ and flags energy as unsupported so that downstream combined cost metrics (Section~\ref{s:combined-cost}) can degrade gracefully.
+
+We restricted energy attribution to the CPU package to maintain portability and reproducibility; DRAM or uncore domains were excluded to avoid partial availability across heterogeneous hosts and to prevent incomparable aggregates.
+
+\subsection{Per-Log Attribution \& Units Normalization}
+\label{s:per-log-energy-normalization}
+Let $\text{latency}_t$ be the wall-clock end-to-end time (milliseconds) to ingest log $t$ through the chosen backend, and $\Delta E_t$ the CPU package energy (joules) defined above. Because latency and energy inhabit different numeric scales and exhibit different variance characteristics, we first ensured consistent units and then (optionally) formed normalized statistics.
+
+We store raw:
+\[
+\text{latency}_t^{(\mathrm{ms})} \in \mathbb{R}_{\ge 0}, \qquad \Delta E_t^{(\mathrm{J})} \in \mathbb{R}_{\ge 0}.
+\]
+
+For reporting secondary metrics (e.g., Wh per 1000 logs or estimated $\text{CO}_2$), we applied deterministic conversions (not used inside learning rewards):
+\[
+\text{Wh}_{\text{batch}} = \frac{\sum_{t \in B} \Delta E_t}{3600}, \qquad
+\text{CO}_2(B) = \text{Wh}_{\text{batch}} \cdot \kappa_{\text{grid}},
+\]
+where $\kappa_{\text{grid}}$ is the regional emission factor (kg $\text{CO}_2$/Wh). In the experiments, we fixed $\kappa_{\text{grid}}$ for relative comparability; absolute emission estimates are illustrative only.
+
+To permit an energy-latency combined cost (Section~\ref{s:combined-cost}) that remains interpretable without per-run dynamic normalization, we deliberately avoid z-scoring in the cost function. Instead, we introduce a scalar coefficient $\lambda$ (units ms/J) that aligns the magnitude of the energy term with typical latency magnitudes (see next subsection). Outlier handling: If either measurement is missing (energy unsupported or timeout), we tag the sample and exclude it from the energy distribution plots while still retaining latency.
+
+Finally, the per-log CSV outputs include:
+\[
+(\text{timestamp}_t, \text{backend}_t, \text{latency}_t^{(\mathrm{ms})}, \Delta E_t^{(\mathrm{J})}, \text{cost}_t, \text{flags}_t)
+\]
+where $\text{flags}_t$ encodes the energy validity to facilitate downstream aggregation filters.
+
+\subsection{Combined Cost Formulation (Latency + $\lambda \cdot$ Energy)}
+\label{s:combined-cost}
+To expose an energy-performance trade-off to learning routers without obscuring interpretability, we define a linear scalarized per-log cost as follows:
+\[
+C_t = \text{latency}_t^{(\mathrm{ms})} + \lambda \,\Delta E_t^{(\mathrm{J})},
+\]
+where $\lambda$ (units ms/J) scales the joules into an equivalent latency penalty. Let $\bar{L}$ denote a representative latency scale (e.g., median of recent decisions) and $\bar{E}$ a representative energy scale (median joules). A principled initialization is as follows:
+\[
+\lambda^\star = \frac{\bar{L}}{\bar{E}},
+\]
+which balances the expected contributions of both terms at the median. In practice, we adopt a fixed $\lambda$ (default $1000$) chosen empirically so that the energy term neither dwarfs nor vanishes relative to typical millisecond latencies (package-joule magnitudes observed in our workload are on the order $10^{-3}$--$10^{-2}$ J, producing additive terms of $1$--$10$ ms).
+
+This static scaling preserves (i) reproducibility across runs (no drifting normalization), (ii) additivity across logs (enabling simple summations for batch cost), and (iii) transparency (each joule interpreted as $\lambda$ ms budget impact).
+
+Routers that optimize the expected return (RL) or select the minimum empirical cost (CBR) can internalize a unified objective:
+\[
+\min \ \mathbb{E}\big[C_t \mid \text{policy}\big] = \mathbb{E}[\text{latency}_t] + \lambda \,\mathbb{E}[\Delta E_t].
+\]
+
+Sensitivity: decreasing $\lambda$ biases toward latency-exclusive optimization; increasing $\lambda$ shifts the preference toward energy-efficient backends. Because the formulation is linear, the Pareto frontier exploration can be approximated by sweeping $\lambda$ and plotting $(\mathbb{E}[\text{latency}], \mathbb{E}[\Delta E])$ pairs.
+
+If energy acquisition is unsupported (Section~\ref{s:rapl-acquisition}), we set $\Delta E_t = 0$ and the metric degenerates to pure latency.
+
+\bigskip
+\noindent\textbf{Section Summary.} We (i) capture low-overhead CPU package energy via RAPL, (ii) attribute per-log energy deltas paired with latency, and (iii) expose a tunable linear scalarization enabling routers to trade latency against energy explicitly while retaining the auditability of each raw dimension.
+
+
+
+
+
+
+\section{Experimental Setup}\label{s:experimental-setup} 
+
+This section details the empirical evaluation environment that underpins all the reported results. We first describe the datasets and stream construction strategies (Section~\ref{s:datasets-sampling}), and then enumerate the hardware and software baselines to support reproducibility (Section~\ref{s:hardware-software}). We formalize the experimental controls, that is, random seeds, episode definitions, and RL time-step budgets (Section~\ref{s:experimental-controls})before contrasting the offline training phases for reinforcement learning agents with the intrinsic online adaptation of CBR (Section~\ref{s:training-eval-protocol}). Finally, we catalog all emitted artifacts (logs, summaries, metadata, and checkpoints) to clarify provenance and enable independent replication (Section~\ref{s:outputs-artifacts}).
+
+\subsection{Datasets \& Sampling Modes}
+\label{s:datasets-sampling}
+
+We evaluate two complementary log corpora chosen to exercise both the semantic diversity and scale sensitivity of adaptive routing:
+
+\paragraph{Real-World (Loghub 2.0 Extract).} A curated subset (\(\sim 14{,}000\) entries) from the Loghub 2.0 collection covering heterogeneous system components (authentication, storage, scheduling) with a naturally occurring imbalance in severity levels and message templates. This dataset stresses \emph{semantic discrimination} (e.g., security-related tokens vs. routine status updates) while remaining tractable for rapid iteration and ablation studies.
+
+\paragraph{Synthetic Datacenter Logs.} A procedurally generated corpus (\(\sim 200{,}000\) entries) emulating a multi-service data center. Parameterized generators produce controllable mixtures of (i) high-frequency low-severity operational noise, (ii) moderate-frequency performance anomalies, and (iii) low-frequency sensitive or security-relevant events. This scale emphasizes adaptation latency, bucket coverage (CBR), and exploration efficiency (RL).
+
+\medskip
+Each raw log record is transformed into: (i) discrete categorical attributes (e.g., \texttt{Level}, \texttt{Component}, \texttt{LogSource}), (ii) a DistilBERT embedding \(\mathbf{e} \in \mathbb{R}^{768}\) of the message text, and (iii) instantaneous system metrics (CPU utilization, queue depth, etc.) forming a concatenated observation vector of dimension 774 for learning-based routers (Sections~\ref{s:qlearning} and~\ref{s:a2c}).
+
+\paragraph{Sampling Modes.} To mitigate bias from the sequential structure and enable controlled difficulty, we support three sampling regimes when presenting logs to routers:
+
+\begin{itemize}
+  \item \textbf{Head (Sequential Head Slice).} The first \(N\) lines of the file in the original order. Provides a reproducible fixed prefix that is useful for smoke tests and deterministic profiling.
+  \item \textbf{Random.} Uniform sampling without replacement over the entire corpus size \(N\) and shuffling the presentation order. This reduces temporal locality and guards against order-sensitive overfitting (particularly for CBR bucket statistics).
+  \item \textbf{Balanced.} Stratified sampling ensures approximately uniform counts across a chosen categorical attribute set (default: severity level) until exhaustion. When a stratum underflows before others, the residual capacity is filled by proportional allocation from the remaining strata. Balancing dampens majority class dominance and accelerates the acquisition of informative variance for both CBR attribute scoring and RL value estimation.
+\end{itemize}
+
+Let \(D = \{r_1,\dots,r_N\}\) be the dataset and \(\mathcal{S}\) the sampling operator producing an ordered stream \(S = (r_{i_1}, r_{i_2}, \dots, r_{i_M})\). For the balanced mode over strata \(\mathcal{C} = \{c_1,\dots,c_K\}\) with counts \(n_k\), we target \(q_k = \left\lceil \frac{M}{K} \right\rceil\) per class, falling back to \(\min(q_k, n_k)\) with iterative reallocation of surplus. All modes record the effective permutation (or allocation table) in the run metadata for auditability and reproducibility.
+
+\paragraph{Rationale.} Presenting multiple sampling modes enables stress-testing robustness: policies should (i) retain gains under distribution reshuffling (Random), (ii) demonstrate rapid warm-up under scarce but balanced high-signal events (Balanced), and (iii) degrade gracefully when facing realistically skewed sequential prefixes (Heads). We report the metrics per mode where space permits; primary comparisons use the mode indicated in each figure caption for clarity.
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\caption{Log dataset schema}
+\label{tab:dataset-schema}
+\begin{tabularx}{\linewidth}{@{}l l X@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Description} \\
+\midrule
+LineId & Integer & Sequential line/index of the log entry in the source file. \\
+Time & String & Timestamp as found in the log (\texttt{Sun Dec 04 04:47:44 2005} or \texttt{18:06:20,076}). \\
+EventId & String & Template identifier assigned after parsing (\texttt{E2}, \texttt{E91}). \\
+Level & String & Log level/severity (\texttt{notice}, \texttt{INFO}, \texttt{ERROR}, \texttt{WARN}). \\
+EventTemplate & String & Normalized message pattern with placeholders \texttt{<*>}. \\
+Content & String & Original/raw log message text. \\
+Component & String & Emitting component/module/class, when available. \\
+Date & Date & Calendar date when stored separately from \texttt{time}. \\
+Node & String & Hostname/node that emitted the log (if present). \\
+LogSource & String & System or dataset source. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+
+
+
+\subsection{Hardware \& Software Environment}
+\label{s:hardware-software}
+
+\paragraph{Host Hardware.} The experiments were run on a single Linux host with the following specifications:
+\begin{itemize}
+  \item \textbf{CPU:} Intel (x86\_64) processor supporting RAPL package energy counters.
+  \item \textbf{Cores/Threads:} (Logical core count documented in run metadata).
+  \item \textbf{Memory:} Sufficient system RAM to hold both datasets in page cache (actual GB value recorded in metadata).
+  \item \textbf{Storage:} SSD-backed filesystem ensuring low jitter for MySQL and Elasticsearch writes.
+\end{itemize}
+We isolated the competing background load (no extraneous CPU-intensive processes) and fixed the CPU frequency scaling to the default governor (not manually pinned) to reflect the typical deployment conditions. Thermal throttling was not observed (checked via the absence of anomalous latency spikes correlated with dmesg thermal messages).
+
+\paragraph{Virtualized Services (Docker).} The three storage backends (MySQL, Elasticsearch/Kibana (ELK), and IPFS node/daemon) are provisioned via a single \texttt{docker-compose. yml} file, ensuring consistent container versions across runs. Container resource limits (CPU shares, memory) were left at defaults to avoid artificial contention skew unless otherwise noted. This mirrors a pragmatic lightweight deployment rather than a tightly resource-sliced cluster.
+
+\paragraph{Software Stack.}
+\begin{itemize}
+  \item \textbf{Operating System:} Linux kernel (version captured in experiment metadata).
+  \item \textbf{Python:} Version $\geq$ 3.9 (exact minor version logged).
+  \item \textbf{Key Libraries:} \texttt{transformers} (DistilBERT embeddings), \texttt{stable-baselines3} (A2C), \texttt{scikit-learn} (PCA, discretization), \texttt{pandas}/\texttt{numpy} (data handling).
+  \item \textbf{RL Reproducibility:} Global RNG seeds (Python, NumPy, PyTorch) set when provided; PyTorch deterministic flags left at defaults to avoid performance penalty (documented in metadata).
+\end{itemize}
+
+\paragraph{Energy Measurement Subsystem.} RAPL readings extracted from the sysfs powercap interface (\texttt{intel-rapl:0}) for every routing decision. A lightweight abstraction caches the file descriptors to minimize the overhead. If RAPL is unavailable, the system sets an \texttt{energy\_supported = false} flag; downstream combined cost computations automatically revert to latency-only.
+
+\paragraph{Backend Configuration.}
+\begin{itemize}
+  \item \textbf{MySQL:} Default transactional table engine (InnoDB). Autocommit retained. No query caching modifications were made.
+  \item \textbf{Elasticsearch:} Default index settings (single node). Explicit refresh is not forced per insert; we rely on eventual indexing to reflect the typical operational write path latency. Latency measurement stops after client acknowledgment and not after searchability.
+  \item \textbf{IPFS:} Local daemon with default pin and garbage collection settings; add operations measured until hash receipt.
+\end{itemize}
+
+\paragraph{Isolation \& Fairness.} All routers share an identical log presentation order within a run configuration (same sampled stream), enforced by persisting the realized permutation/allocation. RL agents are evaluated \emph{frozen} (no parameter updates) in test mode, ensuring that online adaptation advantages accrue solely to CBR (Section~\ref{s:training-eval-protocol}). Between router evaluations, the container state (indexes, table growth) is intentionally \emph{not} reset, reflecting cumulative storage growth conditions; this favors realism over a sterile cold-start per method.
+
+\paragraph{Monitoring.} Latency is measured wall-clock around the exact backend write call. Energy differential windows tightly bracket only the routing decisions and backend I/O code paths. Outlier detection (e.g., due to transient Docker maintenance tasks) is limited to post-hoc reporting—no runtime filtering beyond counter wrap detection—to preserve the transparency.
+
+
+
+\subsection{Experimental Controls (Seeds, Episode Lengths, Timesteps)}
+\label{s:experimental-controls}
+
+A robust comparison of heterogeneous routing strategies requires tightly specified control levers governing the stochasticity, training horizon, and evaluation scope. We standardized these along four axes: random seed handling, episode semantics for tabular Q-learning, time-step budgeting for A2C, and stream reuse across routers.
+
+\paragraph{Random Seeds.} When a seed $s$ is provided (CLI flag \texttt{--seed}), we deterministically set Python's \texttt{random}, NumPy, and PyTorch RNGs to $s$, and record $s$ in all metadata artifacts (Sections~\ref{s:qlearning} and~\ref{s:a2c}). The absence of a seed yields non-deterministic (host RNG–driven) runs, which are explicitly tagged \texttt{seed: null} to prevent false assumptions of repeatability. The Docker container instantiation order is not separately fixed; however, its effect on our measurements is negligible because the backend warm caches are intentionally permitted (Section~\ref{s:hardware-software}).
+
+\paragraph{Episode Definition (Q-learning).} Tabular Q-learning training proceeds over $E$ episodes (user flag \texttt{--q\_episodes}). An episode presents a fixed-length slice of the sampled log stream until either (i) a maximum per-episode decision count $L_{\max}$ is reached or (ii) the stream is exhausted. In practice, we set $L_{\max}$ equal to the stream length divided by $E$ (integer floor) to distribute coverage. Terminal states are only episodic boundaries; no environmental reset semantics alter the feature extraction pipeline. The reward is accumulated per episode and used for adaptive epsilon plateau detection (Section~\ref{s:qlearning-adaptive-eps}).
+
+\paragraph{Timestep Budget (A2C).} Advantage Actor–Critic optimization is parameterized by the total training time steps $T$ (flag \texttt{--timesteps}) and rollout horizon $n$ steps per update (flag \texttt{--n\_steps}). With $n_{\text{env}}$ parallel environments (default 1), the number of gradient updates is:
+\[
+U = \left\lfloor \frac{T}{n \cdot n_{\text{env}}} \right\rfloor.
+\]
+The learning rate linear decay (if enabled) interpolates from $lr_0$ to $0$ across $T$ steps; entropy coefficient annealing (if enabled) interpolates over a configured subrange $T_{\text{ent}} \le T$. Evaluation (if \texttt{--eval\_interval} $>0$) pauses training every $I$ time steps to run $K$ evaluation episodes using the frozen policy snapshot, optionally updating the persistent best model.
+
+\paragraph{Stream Reuse Across Routers.} For a given run configuration (dataset + sampling mode + seed), we materialized the ordered log stream once and reused it across all evaluated routers (CBR, Q-learning, A2C, and direct baselines). This isolates policy quality differences from presentation order artifacts. CBR uniquely updates statistics online during evaluation, whereas RL agents (both tabular and deep) are strictly inference-only in the evaluation mode.
+
+\paragraph{Warm-Up Phases.} (i) CBR employs a sample-count warm-up before the first attribute selection (flag \texttt{--cbr\_warm\_samples}); (ii) A2C optionally performs a scaler warm-up (\texttt{--scaler\_warmup}) collecting raw observations without parameter updates; (iii) Q-learning initializes unseen state-action values with either zeros or a teacher-derived prior (Section~\ref{s:qlearning-guided}). These warm-up mechanics are orthogonal and are logged distinctly in the metadata to prevent the misinterpretation of the initial low-throughput intervals.
+
+\paragraph{Epsilon / Exploration Schedules.} The base geometric decay of Q-learning (if enabled) and plateau-triggered adaptive drops are fully parameterized via CLI flags and written to metadata version 3 (Section~\ref{s:qlearning-adaptive-eps}). A2C exploration arises implicitly from policy stochasticity; optional entropy annealing (Section~\ref{s:a2c-schedules}) modulates the variance but does not require per-episode manual resets.
+
+\paragraph{Reproducibility Assurance.} Each aggregated summary CSV embeds (i) dataset fingerprint (SHA-1 over raw CSV bytes), (ii) effective sampling mode, (iii) seed (or null), and (iv) RL training reuse indicators (boolean). This minimal provenance bundle suffices to reconstruct the exact evaluation stream and align it with the stored model artifacts.
+
+\subsection{Routing Methods Under Test}
+We evaluated six routing strategies to provide a comprehensive comparison.
+
+\begin{itemize}
+    \item \textbf{Three Fixed Baselines:} Each routes all logs to a single backend (MySQL-only, Elasticsearch-only, IPFS-only). These serve as simple performance baselines and sanity checks for the measurement pipelines.
+    
+    \item \textbf{Static Router:} Uses predefined, heuristic rules (route kernel/SSH traffic to IPFS, error-heavy logs to Elasticsearch, routine messages to MySQL).
+    
+    \item \textbf{Q-learning Router:} Learns a policy via tabular Q-learning on a discretized state space, using PCA and quantile binning. Employs $\varepsilon$-greedy exploration with a bias towards the static policy.
+    
+    \item \textbf{A2C Router:} Learns a policy using the A2C algorithm from the Stable-Baselines3 library, training on the same reward signal.
+\end{itemize}
+
+\subsection{Trainings \& Evaluation Protocol (Offline RL vs Online CBR)}
+The evaluation was conducted in two distinct phases, as shown in Figure~\ref{fig:experiment-pipeline}.
+
+\textbf{Phase 1: Training.} The learning-based routers (Q-learning and A2C) were trained in the environment.
+
+\begin{itemize}
+    \item \textbf{Q-learning:} The agent collected a warm-up buffer (5,000 observations) to fit its PCA model and quantile binners. It was then trained for 2,000 episodes using $\varepsilon$-greedy exploration.
+    
+    \item \textbf{A2C:} The agent was trained for a fixed number of time steps using on-policy rollouts.
+\end{itemize}
+
+Artifacts (Q-tables, PCA models, and Stable-Baselines3 checkpoints) were saved for Phase 2.
+
+\textbf{Phase 2: Evaluation.} All six routing methods were evaluated using the same sampled log stream. The learned models were loaded and executed deterministically (without any exploration). For each log write, we recorded the routing latency, backend latency, success status, and CPU energy consumption.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.99\linewidth]{vu-cs-standard-thesis/0_frontmatter/figures/eval2.png}
+\caption{The two-phase experimental pipeline for training and evaluating routing policies.}
+\label{fig:experiment-pipeline}
+\end{figure}
+
+
+
+\subsection{Outputs \& Logged Artifacts}
+\label{s:outputs-artifacts}
+
+To support transparency, post hoc analysis, and reproducibility, the system emits a layered set of artifacts spanning per-log traces, aggregated summaries, model checkpoints, and diagnostic metadata. Table~\ref{tab:artifact-summary} (optional if space permits) summarizes these; we detail the semantics below.
+
+\paragraph{Per-Log Traces.} For each router $r$ we write
+\[
+\texttt{results/}<r>_<\text{dataset}>.\texttt{csv}
+\]
+containing one row per processed log with the following columns:
+\[
+(\text{idx}, \text{timestamp}, \text{backend}, \text{raw\_destination}, \text{latency\_ms}, \Delta E_{\text{J}}, \text{cost}, \text{compliance\_forced}, \text{flags})
+\]
+where (i) \texttt{raw\_destination} is the router's pre-compliance choice (identical to \texttt{backend} if not overridden), (ii) \texttt{flags} encodes energy validity/fallback events, and (iii) \texttt{cost} is latency or combined cost depending on the run configuration. Traces enable a fine-grained latency distribution and per-attribute diagnostics.
+
+\paragraph{Per-Router Summaries.} For each router we emit
+\[
+\texttt{results/summary\_}<r>_<\text{dataset}>.\texttt{csv}
+\]
+capturing scalar metrics: mean / median / p95 latency, success rate, destination mix proportions, average energy per log (J), combined cost components, and compliance coverage metrics (if enabled). These isolate performance characteristics without cross-router aggregation noise.
+
+\paragraph{Combined Summary.} A single
+\[
+\texttt{results/combined\_summary\_}<\text{dataset}>.\texttt{csv}
+\]
+joins all router summaries side-by-side, adding relative improvement deltas over a configurable baseline (default: best-direct backend). Optional Markdown rendering (\texttt{--write\_markdown}) produces a companion \texttt{.md} table for direct inclusion in reports.
+
+\paragraph{Experiment Metadata.} File
+\[
+\texttt{results/experiment\_metadata\_}<\text{dataset}>.\texttt{json}
+\]
+contains the dataset fingerprint (SHA-1), sampling mode, realized stream length, seed (or null), wall-clock durations per phase (training vs. evaluation), RL training reuse booleans, git commit hash, environment identifiers (Python version, library versions), and feature vector dimension. This JSON is the canonical provenance anchor.
+
+\paragraph{RL Artifacts.}
+\begin{itemize}
+  \item \textbf{Q-learning:} \_q\_table.pkl, \_scaler.pkl, \_pca.pkl, \_binner.pkl, \_metadata.json (versioned schema with embedding dimension, exploration config, adaptive epsilon events).
+  \item \textbf{A2C:} base.zip (final policy), \_best.zip (optional best eval model), \_metadata.json (version 1 fields: hyperparameters, schedules, reward stats), \_scaler.pkl (if warm-up used), intermediate checkpoints (if \texttt{--checkpoint\_interval} specified).
+\end{itemize}
+All model metadata embed a \texttt{version} integer; the loading code enforces forward compatibility by validating the required fields and dimensions (falling back when mismatched).
+
+\paragraph{CBR Diagnostics.} When enabled:
+\[
+\texttt{cbr\_diag.json} \text{ (overwrite / append / timestamp modes)}
+\]
+periodically records the attribute score rankings, selected classifier, per-bucket sample counts, and backend cost aggregates. This supports interpretability (e.g., verifying when a high-gain attribute is adopted).
+
+\paragraph{Compliance Metrics Augmentation.} If compliance is active, per-router summary and combined summary rows include: \texttt{sensitive\_total}, \texttt{sensitive\_coverage}, \texttt{leakage\_rate}, \texttt{non\_sensitive\_ipfs\_fraction}, \texttt{compliance\_score}. The effective sensitive pattern list was duplicated into the experiment metadata to avoid ambiguity due to evolving defaults.
+
+\paragraph{Reward / Exploration Logs.}
+\begin{itemize}
+  \item Q-learning: optional reward history CSV and adaptive event NDJSON (Section~\ref{s:qlearning-adaptive-eps}).
+  \item A2C: optional \texttt{a2c\_rewards.csv} plus TensorBoard event files (policy loss, value loss, entropy, learning rate) under \texttt{runs/}.
+\end{itemize}
+
+\paragraph{Scalar Energy\& Emissions Aggregates.} Batch-level energy (Wh) and illustrative CO$_2$ estimates were recomputed from per-log \(\Delta E_t\) (Section~\ref{s:per-log-energy-normalization}) during summary generation; we do not persist a separate emissions file to avoid redundancy.
+
+\paragraph{Failure / Fallback Indicators.} Any artifact incompatibility (dimension or version mismatch) triggers the following:
+\begin{enumerate}
+  \item A warning entry in experiment metadata.
+  \item Router-level flags in combined summary (\texttt{artifact\_valid=false}, \texttt{fallback=static}).
+  \item Continuation of evaluation with static decisions for comparability.
+\end{enumerate}
+
+\paragraph{Retention Strategy.} Large intermediate checkpoint sets (A2C) are optional; users can disable them by omitting \texttt{--checkpoint\_interval}. The CBR diagnostic frequency should be tuned to balance interpretability vs. I/O overhead (default disabled). All file naming is deterministic, given artifact prefixes to simplify cleanup and version control ignoring.
+
+Optional artifact summary table (include if space)
+\begin{table}[h]
+\centering
+\caption{Artifact categories and purposes.}
+\label{tab:artifact-summary}
+\begin{tabular}{ll}
+\toprule
+Artifact\& Purpose \\
+\midrule
+Per-log CSV\& Raw decision trace for distributional / attribution analysis \\
+Summary CSV\& Router-specific scalar metrics \\
+Combined summary\& Cross-router comparative metrics + deltas \\
+Experiment metadata JSON\& Provenance, configuration, environment \\
+Q-learning metadata\& State abstraction + exploration provenance \\
+A2C metadata\& Hyperparameters, schedules, reward statistics \\
+CBR diagnostics JSON\& Online attribute gain evolution (optional) \\
+Reward history / events\& Learning dynamics visualization \\
+Checkpoints\& Temporal snapshots (A2C) for robustness / rollback \\
+\bottomrule
+\end{tabular}
+ \end{table}
+
+\paragraph{Reproducibility Path.} Given (i) dataset CSV, (ii) experiment metadata JSON, and (iii) RL artifact directories, a third party can reconstruct the evaluation stream order, reload policies, and regenerate combined summaries deterministically (modulo nondeterministic low-level kernel scheduling noise within single-digit microseconds, immaterial to the reported metrics).
+
+This structured output ensures a complete provenance trail, allowing for the 
+reproduction of all the figures and results. The complete flow of data from the 
+system to these output artifacts is shown in Figure~\ref{fig:export}.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.99\linewidth]{vu-cs-standard-thesis/0_frontmatter/figures/data_export_flow.png}
+\caption{Data export and artifact generation flow.}
+\label{fig:export}
+\end{figure}
+
+
+
+\section{Orchestration \& Automation}
+\label{s:orchestration}
+
+\subsection{Unified Pipeline (Training Detection \& Reuse)}
+\label{s:orchestration-unified-pipeline}
+To ensure methodological fairness and eliminate configuration drift between router evaluations, we implemented a unified orchestration layer (implemented in \texttt{src/experiment. py}) that encapsulates: (i) artifact presence  and compatibility checks, (ii) conditional (re-)training of learning-based routers (Q-Learning and A2C), and (iii) a single-pass evaluation stream over the selected dataset for all routers. Let $\mathcal{R}_{\text{learn}} = \{\text{Q}, \text{A2C}\}$ denote routers requiring offline training and $\mathcal{R}_{\text{direct}} = \{\text{CBR}, \text{direct\_mysql}, \text{direct\_elk}, \text{direct\_ipfs}\}$ those that are training-free (CBR adapts online but has no pre-training phase). Before evaluation, the orchestrator computes for each $r \in \mathcal{R}_{\text{learn}}$:
+\[
+\text{NeedsRetrain}(r) := \neg \text{AllArtifactsPresent}(r) \;\lor\; \neg \text{MetadataCompatible}(r) \;\lor\; \text{ForceRetrainFlag},
+\]
+where \texttt{MetadataCompatible} validates the schema version, embedding dimensionality, PCA/binning configuration (Q-Learning), scaler presence expectations, and hyperparameter signatures. Only routers with $\text{NeedsRetrain}(r)=\text{true}$ incur training costs; the others reuse existing artifacts, guaranteeing consistent baselines across repeated experimental runs while avoiding unnecessary recomputation (time  and energy savings).
+
+A single canonical sampling configuration (dataset path + sampling mode + random seed) materializes an ordered sequence of logs that are streamed identically to every evaluated router to ensure strict comparability (no reshuffling-induced variance). For learning-based routers, parameters affecting training (episodes, time steps, entropy/epsilon schedules, and scaler warm-up length) are captured in \emph{training metadata} and duplicated into the final experiment metadata bundle to enable full-provenance reconstruction.
+
+\paragraph{Execution Flow.}
+\begin{enumerate}
+    \item Parse CLI arguments; compute dataset fingerprint (hash of filename, size, plus hash of first/last $k$ lines).
+    \item For each $r \in \mathcal{R}_{\text{learn}}$: evaluate $\text{NeedsRetrain}(r)$; if true, launch training and persist artifacts $\mathcal{A}_r$ (model weights, transformers, metadata).
+    \item Instantiate evaluation objects: freeze parameters for $\mathcal{R}_{\text{learn}}$; initialize CBR cold (empty statistics).
+    \item Stream log entries $(\ell_1,\ldots,\ell_N)$ once; for each router $r$ apply its routing decision (post compliance override if enabled), measure latency and energy, append a per-log trace row.
+    \item After all routers complete, aggregate metrics (Section~\ref{s:orchestration-aggregation}), write cross-router summary and experiment metadata JSON (including which trainings were reused vs.\ performed fresh).
+\end{enumerate}
+
+\paragraph{Determinism Guards.} Global seeds (Python, NumPy, PyTorch) plus a fixed-order iterator over the log stream enforce reproducibility given identical artifact versions and host environment (cf.~Experimental Setup Section~\ref{s:experimental-setup}). A failed compatibility check (e.g., changed embedding length) triggers a safe fallback: the obsolete artifact is ignored, and retraining proceeds, preventing silent misalignment.
+
+\subsection{Aggregation \& Metric Computation}
+\label{s:orchestration-aggregation}
+Post-evaluation aggregation transforms per-log traces into per-router summaries and a cross-router comparison table. Let
+\[
+D_r = \{ (t_i^{(r)}, e_i^{(r)}, s_i^{(r)}, \mathbf{1}_{\text{success},i}^{(r)}, \mathbf{1}_{\text{sensitive},i}, d_i^{(r)}) \}_{i=1}^{N}
+\]
+denote, for router $r$, total latency (ms), energy (J), raw backend status, success indicator, sensitivity indicator (compliance classification), and final destination category, respectively. Metrics:
+\[
+\text{MeanLatency}(r)=\frac{1}{N}\sum_{i=1}^{N} t_i^{(r)}, \qquad
+\text{MedianLatency}(r)=\text{P}_{50}(\{t_i^{(r)}\}), \qquad
+\text{P95Latency}(r)=\text{P}_{95}(\{t_i^{(r)}\}),
+\]
+\[
+\text{SuccessRate}(r)=\frac{1}{N}\sum_{i=1}^N \mathbf{1}_{\text{success},i}^{(r)}, \qquad
+\text{EnergyMean}(r)=\frac{1}{N}\sum_{i=1}^N e_i^{(r)}.
+\]
+Destination mix proportions:
+\[
+\pi_{b}(r)=\frac{1}{N}\sum_{i=1}^N \mathbf{1}[d_i^{(r)}=b], \quad b \in \{\text{mysql},\text{elk},\text{ipfs}\}.
+\]
+Compliance-aware metrics (evaluated per router after overrides)
+\[
+\text{SensitiveCoverage}(r)=\frac{\sum_{i=1}^N \mathbf{1}_{\text{sensitive},i}\cdot \mathbf{1}[d_i^{(r)}=\text{ipfs}]}{\sum_{i=1}^N \mathbf{1}_{\text{sensitive},i}}, \quad
+\text{Leakage}(r) = \sum_{i=1}^N \mathbf{1}_{\text{sensitive},i}\cdot \mathbf{1}[d_i^{(r)}\neq \text{ipfs}],
+\]
+with $\text{ComplianceScore}(r) = \mathbf{1}[\text{Leakage}(r)=0]$.
+
+\paragraph{Streaming Computation.} Latency percentiles (median, p95) are derived via exact sort (feasible at our scale) or optionally a Greenwald--Khanna sketch (not enabled by default). Aggregation algorithm:
+\begin{enumerate}
+    \item Initialize accumulators (sums, destination counts, sensitive counters).
+    \item Single pass over each per-log CSV; update sums and counts; append latency to a list.
+    \item Compute percentiles; compose per-router summary row; write summary CSV.
+    \item After all routers, emit combined summary table (CSV; optional Markdown).
+\end{enumerate}
+
+\paragraph{Energy Normalization.} When the RAPL energy is unsupported (all zeros), the summaries retain energy columns plus a metadata flag marking the acquisition status to prevent misinterpretation as true zero consumption.
+
+\paragraph{Robustness.} Partial evaluation (router crash) yields a \texttt{status=incomplete} marker; such routers are excluded from cross-router comparative statistics while preserving the raw traces for diagnosis.
+
+\subsection{Compliance vs Baseline Run Pairing}
+\label{s:orchestration-compliance-pairing}
+To isolate the marginal effect of hard compliance enforcement on routing efficiency, we adopted a paired-run design: for the same dataset sampling configuration and identical pre-trained artifacts, we executed two orchestrated evaluations: (a) baseline (compliance disabled) and (b) compliance-enabled (pattern override active). Let a paired set be indexed by $k$ with a shared log sequence $\{\ell_i^{(k)}\}_{i=1}^{N_k}$. For any router $r$, define the paired deltas as
+\begin{align}
+\Delta \text{MeanLatency}_r^{(k)} 
+  &= \text{MeanLatency}_r^{(k,\text{comp})} - \text{MeanLatency}_r^{(k,\text{base})}, \\
+\Delta \text{EnergyMean}_r^{(k)} 
+  &= \text{EnergyMean}_r^{(k,\text{comp})} - \text{EnergyMean}_r^{(k,\text{base})}.
+\end{align}
+
+Destination redistribution toward IPFS:
+\[
+\Delta \pi_{\text{ipfs},r}^{(k)} = \pi_{\text{ipfs}}^{(k,\text{comp})}(r) - \pi_{\text{ipfs}}^{(k,\text{base})}(r).
+\]
+Because log ordering and router stochasticity sources (RL policies frozen at evaluation) are held constant, the variance of these deltas reflects only compliance-induced routing path changes. For $K$ paired datasets (or repeated seeds), we report the mean and optional $95\%$ confidence intervals:
+\[
+\overline{\Delta \text{MeanLatency}}_r = \frac{1}{K} \sum_{k=1}^K \Delta \text{MeanLatency}_r^{(k)}, \qquad
+\text{CI}_{95} = t_{0.975, K-1}\cdot \frac{\sigma_{\Delta}}{\sqrt{K}},
+\]
+where $\sigma_{\Delta}$ is the sample standard deviation of paired differences.
+
+\paragraph{Leakage Sanity.} Any non-zero leakage in a compliance-enabled run aborts the aggregation of deltas (guard-rail for regression in pattern detection). A compliance integrity flag was recorded in the experimental metadata to confirm leak-free enforcement.
+
+\paragraph{Interpretation.} A small positive $\Delta \text{MeanLatency}$ with zero leakage and modest $\Delta \text{EnergyMean}$ indicates limited performance overhead, and a large $\Delta \pi_{\text{ipfs},r}$ quantifies the archival shift. This frames the governance versus efficiency trade-off.
+
+\paragraph{Reconstruction.} Each paired evaluation stores a harmonized metadata bundle containing the commit hash, artifact hashes, pattern list, dataset fingerprint, compliance flag, and orchestrator parameter snapshot; thus, any reported delta metric is reproducible by re-running the orchestrator with that configuration.
+
+\paragraph{Summary.} The orchestrator centralizes (i) the artifact lifecycle, (ii) deterministic evaluation, (iii) robust aggregation, and (iv) paired compliance impact analysis, providing a reproducible methodological spine for all empirical claims in this study.
+
+\section{Implementation Details}\label{s:implementation-details}
+
+\subsection{Key Code Snippets}
+This subsection highlights the concrete implementation patterns that instantiate the methodological design described earlier (routing abstraction, state transformation, adaptive learning, compliance-ready aggregation, and energy instrumentation). We excerpt only the critical fragments; the full source resides under \texttt{src/}.
+
+\paragraph{Router Abstraction.}
+All routing strategies conform to a minimal interface: a pure decision method plus an optional feedback hook for online learners (CBR).
+\begin{lstlisting}[language=Python,caption={Router interface and Static baseline (excerpt)},label={lst:router-base}]
+class BaseRouter(ABC):
+    @abstractmethod
+    def get_route(self, log_entry: dict) -> str:
+        """Return one of: 'mysql', 'elk', 'ipfs'."""
+        raise NotImplementedError
+
+    def observe(self, *, log_entry: dict, destination: str, success: bool,
+                routing_latency_ms: float, backend_latency_ms: float,
+                energy_cpu_pkg_j: float | None = None):
+        return None
+
+class StaticRouter(BaseRouter):
+    def get_route(self, log_entry: dict) -> str:
+        # Security / critical paths to immutable store
+        if _safelower(log_entry.get("LogSource")) == "openssh":
+            return "ipfs"
+        if _safelower(log_entry.get("Component")) == "kernel":
+            return "ipfs"
+        # Severity-based escalation
+        lvl = _safelower(log_entry.get("Level"))
+        if lvl in {"crit","alert","emerg"}:
+            return "ipfs"
+        if lvl in {"err","error","warn"}:
+            return "elk"
+        # Fallback: fast transactional tier
+        return "mysql"
+\end{lstlisting}
+
+\paragraph{Q-Learning Inference Path.}
+Inference uses (Scaler $\rightarrow$ PCA $\rightarrow$ Quantile Binning) to map continuous embeddings to a discrete key for tabular lookup; unseen states fall back to the teacher (static policy).
+\begin{lstlisting}[language=Python,caption={Tabular Q-Learning router state discretization},label={lst:qrouter}]
+class QLearningRouter(BaseRouter):
+    def __init__(self, model_path_prefix="trained_models/q_learning"):
+        # Load artifacts: Q-table, PCA, KBins, scaler, metadata
+        self.q_table = pickle.load(open(f"{model_path_prefix}_q_table.pkl","rb"))
+        self.pca = pickle.load(open(f"{model_path_prefix}_pca.pkl","rb"))
+        self.binner = pickle.load(open(f"{model_path_prefix}_binner.pkl","rb"))
+        self.scaler = pickle.load(open(f"{model_path_prefix}_scaler.pkl","rb"))
+        self.metadata = json.load(open(f"{model_path_prefix}_metadata.json"))
+        self.static = StaticRouter()
+        # Compatibility guard
+        if self.metadata.get("obs_dim") != self.scaler["mean"].shape[0]:
+            self._invalidate("Obs dim mismatch")
+
+    def _discretize_state(self, obs: np.ndarray) -> tuple | None:
+        normed = (obs - self.scaler["mean"]) / self.scaler["std"]
+        reduced = self.pca.transform(normed.reshape(1,-1))
+        bins = self.binner.transform(reduced)
+        return tuple(int(x) for x in bins[0])
+
+    def get_route(self, log_entry: dict) -> str:
+        system = get_system_state()                  # 6-dim system metrics
+        emb = self.log_feature_extractor.get_embedding(log_entry.get("Content",""))
+        obs = np.concatenate([system, emb]).astype(np.float32)
+        key = self._discretize_state(obs)
+        if key and key in self.q_table:
+            a = int(np.argmax(self.q_table[key]))
+            return {0:"mysql",1:"elk",2:"ipfs"}[a]
+        return self.static.get_route(log_entry)
+\end{lstlisting}
+
+\paragraph{Q-Learning Training Loop.}
+Guided exploration (teacher action during $\epsilon$-phase), prior bonus warm-start, adaptive epsilon decay on reward plateaus, and artifact emission (versioned metadata) were implemented.
+\begin{lstlisting}[language=Python,
+    caption={Adaptive Q-Learning training fragment},
+    label={lst:qtrain},
+    breaklines=true,
+    breakatwhitespace=true
+]
+for ep in range(1, episodes+1):
+    s = _disc_state(env.reset(), scaler, pca, binner)
+    ep_reward = 0.0
+    for _ in range(max_steps_per_episode):
+        exploring = np.random.rand() < epsilon
+        if exploring and np.random.rand() < guided_prob:
+            teacher_act = {"mysql":0,"elk":1,"ipfs":2}[teacher.get_route(env.current_log)]
+            a = teacher_act
+        elif exploring:
+            a = env.action_space.sample()
+        else:
+            a = int(np.argmax(Q[s]))
+        obs2, r, done, _ = step(env, a)
+        s2 = _disc_state(obs2, scaler, pca, binner)
+        if s2 not in Q:  # warm-start toward teacher hint
+            Q[s2] = np.zeros(n_actions, dtype=np.float32)
+            t_act = {"mysql":0,"elk":1,"ipfs":2}[teacher.get_route(env.current_log)]
+            Q[s2][t_act] = prior_bonus
+        # Q-update
+        td_target = r + (0 if done else gamma * np.max(Q[s2]))
+        Q[s][a] += alpha * (td_target - Q[s][a])
+        s = s2
+        if not disable_static_eps_decay:
+            epsilon = max(eps_end, epsilon * eps_decay)
+        if done: break
+    rewards_hist.append(ep_reward)
+    # Plateau detection triggers multiplicative epsilon drop
+\end{lstlisting}
+
+\paragraph{A2C Training Enhancements.}
+The learning rate linear decay and entropy coefficient annealing are modular callbacks; optional scaling of observations precedes the environment interaction.
+\begin{lstlisting}[language=Python,
+    caption={Adaptive Q-Learning training fragment},
+    label={lst:qtrain},
+    breaklines=true,
+    breakatwhitespace=true
+]
+model = A2C("MlpPolicy", env,
+            learning_rate=learning_rate,
+            gamma=gamma, ent_coef=ent_coef, vf_coef=vf_coef,
+            n_steps=n_steps, policy_kwargs={"net_arch":dict(pi=policy_hidden, vf=policy_hidden)},
+            seed=seed, tensorboard_log=tensorboard_log)
+
+callbacks = [EpisodeRewardCallback(csv_path=reward_csv_path)]
+if lr_linear_decay:
+    callbacks.append(LRScheduleCallback(total_timesteps=total_timesteps,
+                                        initial_lr=learning_rate))
+if ent_anneal and ent_target and ent_anneal_steps:
+    callbacks.append(EntropyAnnealCallback(start_ent=ent_coef,
+                                           target_ent=ent_target,
+                                           anneal_steps=ent_anneal_steps))
+if checkpoint_interval:
+    callbacks.append(_CheckpointCallback(checkpoint_interval, save_base))
+
+model.learn(total_timesteps=total_timesteps, callback=callbacks)
+model.save(str(save_base))          # base.zip
+# Metadata + optional scaler (_scaler.pkl) persisted afterwards
+\end{lstlisting}
+
+\paragraph{CBR Attribute Scoring \& Bucketed Statistics.}
+Variance-reduction style scoring is recomputed periodically, and buckets are numeric hashes of attribute values.
+\begin{lstlisting}[language=Python,caption={CBR attribute scoring loop},label={lst:cbr-score}]
+def _score_attributes(self):
+    global_vals = [x for v in self.global_stats.values() for x in v]
+    gvar = variance(global_vals)
+    scores = {}
+    for attr, buckets in self.stats.items():
+        wvar, total = 0.0, 0
+        for b, backend_lat in buckets.items():
+            merged = []
+            for lst in backend_lat.values():
+                merged.extend(lst)
+            if len(merged) < 2: continue
+            mean_b = mean(merged)
+            var_b = variance(merged, mean_b)
+            wvar += len(merged) * var_b
+            total += len(merged)
+        if total >= 5 and gvar > 1e-9:
+            scores[attr] = max(0.0, gvar - (wvar / total)) / gvar
+    if scores:
+        self.attr_scores = scores
+        self.classifier_attr = max(scores.items(), key=lambda p: p[1])[0]
+        self._compute_expected()  # cache bucket->backend mean costs
+\end{lstlisting}
+
+\paragraph{Energy Measurement (RAPL + Optional GPU Integration).}
+Energy attribution wraps the execution of backend operations; CPU package Joules are read from sysfs and (optionally) integrated with a rolling GPU sampler.
+\begin{lstlisting}[language=Python,caption={Energy metering snapshot delta},label={lst:energy}]
+def stop(self) -> EnergySample:
+    now = self._read_snapshot()
+    deltas = {k: max(0, now[k]-self._start_vals.get(k, now[k])) for k in now}
+    pkg_uj = self._sum_pkg_uj(deltas)
+    psys_uj = sum(d for k,d in deltas.items() if k.endswith("psys"))
+    cpu_pkg_j = pkg_uj / 1e6
+    psys_j = psys_uj / 1e6
+    if psys_j > 0:
+        gpu_est_j = max(0.0, psys_j - cpu_pkg_j)
+    elif self._gpu_sampler:
+        gpu_est_j = self._gpu_sampler.energy_between(self._t0, time.perf_counter())
+    else:
+        gpu_est_j = 0.0
+    return EnergySample(duration_s=dt, cpu_pkg_j=cpu_pkg_j,
+                        psys_j=psys_j, gpu_est_j=gpu_est_j)
+\end{lstlisting}
+
+\paragraph{Metadata Versioning.}
+Artifacts include JSON metadata embedding structural, statistical, and compatibility-critical fields for forward validation (e.g., \texttt{obs\_dim}, PCA components, bin counts, reward statistics, and training schedules), enabling orchestration logic (Section~\ref{s:orchestration-unified-pipeline}) to detect drift.
+
+\subsection{Artifact Directory Structure \& Naming Conventions}
+This section enumerates the persisted artifacts and the rationale for each naming pattern, ensuring unambiguous reconstruction and automated reuse.
+
+\paragraph{Top-Level Directories.}
+\begin{description}
+  \item[\texttt{trained\_models/}] Persisted learning artifacts (Q-learning tabular assets, A2C policies, optional scalers, metadata, checkpoints).
+  \item[\texttt{results/}] Per-router per-log traces, per-router summaries, cross-router combined summaries, experiment metadata, optional compliance diagnostics.
+  \item[\texttt{figures/}] Visualization outputs (latency distributions, throughput / latency trade-offs, energy breakdown).
+  \item[\texttt{tables/}] Final processed tables (LaTeX/CSV) for publication.
+  \item[\texttt{runs/}] (When TensorBoard logging enabled) scalar and histogram event data.
+\end{description}
+
+\paragraph{Q-Learning Artifact Set (prefix: \texttt{trained\_models/q\_learning}).}
+\begin{center}
+\begin{tabular}{ll}
+\textbf{Suffix}\& \textbf{Content / Purpose} \\
+\hline
+\texttt{\_q\_table.pkl}\& Dict[state tuple $\rightarrow$ Q-vector] (float32) \\
+\texttt{\_pca.pkl}\& Fitted \texttt{sklearn.decomposition.PCA} (dimensionality reduction) \\
+\texttt{\_binner.pkl}\& \texttt{KBinsDiscretizer} (quantile bins over PCA output) \\
+\texttt{\_scaler.pkl}\& Z-score scaler \{\texttt{mean}, \texttt{std}\} (float32 arrays) \\
+\texttt{\_metadata.json}\& Versioned JSON: structural dims, hyperparams, reward stats, adaptive events \\
+\end{tabular}
+\end{center}
+The shared prefix guarantees constant-time existence checks; the orchestrator compatibility logic reads \texttt{metadata.json} first to short-circuit loading if obsolete.
+
+\paragraph{A2C Artifact Set (base name e.g.\ \texttt{trained\_models/a2c\_log\_router}).}
+\begin{center}
+\begin{tabular}{ll}
+\textbf{Filename}\& \textbf{Purpose} \\
+\hline
+\texttt{a2c\_log\_router.zip}\& Final Stable-Baselines3 policy (weights + architecture) \\
+\texttt{a2c\_log\_router\_best.zip}\& Best-eval snapshot (if evaluation + \texttt{--save\_best}) \\
+\texttt{a2c\_log\_router\_metadata.json}\& Training provenance (RunMetadata schema v1) \\
+\texttt{a2c\_log\_router\_scaler.pkl}\& Optional observation scaler (mean/std) \\
+\texttt{a2c\_log\_router\_ckpt\_\emph{T}.zip}\& Periodic checkpoint at timestep \emph{T} \\
+\texttt{a2c\_rewards.csv}\& (Optional) Per-episode reward curve (episode,reward) \\
+\end{tabular}
+\end{center}
+Suffix conventions (\texttt{\_best}, \texttt{\_metadata}, \texttt{\_scaler}, \texttt{\_ckpt\_T}) enable glob-based grouping while avoiding conflicts with the primary policy basename.
+
+\paragraph{Per-Router Evaluation Outputs.}
+For the dataset name $X$ and router identifier $r$:
+\begin{itemize}
+  \item \texttt{results/}$r$\texttt{\_}$X$\texttt{.csv}: Per-log trace with latency components, energy, final destination, and (optionally) compliance override flags.
+  \item \texttt{results/summary\_}$r$\texttt{\_}$X$\texttt{.csv}: Aggregated metrics (mean, median, p95 latency, success, energy, destination mix, compliance metrics if enabled).
+\end{itemize}
+
+\paragraph{Cross-Router Aggregation.}
+\begin{itemize}
+  \item \texttt{results/combined\_summary\_}$X$\texttt{.csv}: Unified table of all router summaries.
+  \item \texttt{results/combined\_summary\_}$X$\texttt{.md}: (Optional) Markdown-formatted comparative table (for README inclusion).
+  \item \texttt{results/experiment\_metadata\_}$X$\texttt{.json}: Orchestrator provenance (dataset fingerprint, which trainings reused vs retrained, timings, seed, compliance flags).
+\end{itemize}
+
+\paragraph{Compliance Diagnostics.}
+When enabled:
+\begin{itemize}
+  \item Inline columns (\texttt{raw\_destination}, \texttt{compliance\_forced}) inside each per-log CSV.
+  \item Aggregate compliance metrics embedded in per-router summary and combined summary (coverage, leakage, leakage rate, non-sensitive IPFS fraction, compliance score).
+\end{itemize}
+
+\paragraph{CBR State \& Diagnostics.}
+\begin{itemize}
+  \item \texttt{--cbr\_state\_path PATH}: If provided, JSON snapshot containing bucketed latency/energy statistics, selected attribute, decision counters.
+  \item \texttt{--cbr\_json\_dump\_path PATH}: Periodic diagnostic dumps (single file overwrite, NDJSON append, or timestamped archive) containing attribute scores and current classifier.
+\end{itemize}
+
+\paragraph{Adaptive Q-Learning Supplemental Logs.}
+\begin{itemize}
+  \item \texttt{adaptive\_events.ndjson}: Stream of plateau-triggered epsilon drops (\{episode, epsilon\} per line).
+  \item \texttt{reward\_history.csv}: Full reward trajectory externalized when not inlined (episodes exceed threshold).
+\end{itemize}
+
+\paragraph{Energy Acquisition Flags.}
+A field within the experiment metadata notes RAPL availability; if unsupported, energy columns remain (zero or near-zero), but an explicit \texttt{"rapl\_available": false} (or analogous) flag prevents misinterpretation as true zero consumption.
+
+\paragraph{Naming Rationale.}
+The pattern \texttt{<base>[\_qualifier][.ext]} maintains:
+\begin{enumerate}
+  \item \textbf{Deterministic Discovery}: Orchestrator can test a fixed list of expected suffixes.
+  \item \textbf{Collision Avoidance}: Each semantic layer (model, scaler, metadata, diagnostics) maps to a unique suffix.
+  \item \textbf{Forward Compatibility}: Versioned metadata JSON mediates structural evolution without changing file basenames.
+  \item \textbf{Human Parsability}: Filenames express both lineage (prefix) and function (suffix) without requiring directory nesting depth.
+\end{enumerate}
+
+\paragraph{Reconstruction Contract.}
+Given:
+\begin{itemize}
+  \item Dataset fingerprint (hash + sampling mode)
+  \item Artifact set (all \texttt{trained\_models/} files for chosen routers)
+  \item Experiment metadata JSON
+  \item (Optional) scaler and adaptive event logs
+\end{itemize}
+\noindent a third party can reproduce reported aggregate metrics by replaying the orchestrator with identical flags. Any structural drift (e.g., embedding dimensionality change) is surfaced by compatibility checks before silent degradation can occur.
+
+\paragraph{Summary.}
+The implementation layers (abstract router interface, modular artifact pipeline, adaptive learning callbacks, content-based online statistics, and energy attribution) are deliberately disentangled yet aligned through strict naming conventions and versioned metadata. This design minimizes hidden coupling, accelerates reproducible experimentation, and enables selective recomputation (train-once, evaluate-many) without the risk of stale or incompatible model reuse.
+
+\section{Evaluation Methodology}
+\label{s:evaluation-methodology}
+
+\subsection{Core Metrics (Latency Distribution, Energy, Destination Mix)}
+\label{s:eval-core-metrics}
+We evaluate each router $r$ over an identical ordered log stream $\{\ell_i\}_{i=1}^{N}$ (dataset + fixed sampling mode), yielding per-log measurements:
+\[
+(t_i^{(r)},\; e_i^{(r)},\; d_i^{(r)},\; s_i^{(r)},\; z_i)
+\]
+where $t_i^{(r)}$ is end-to-end routing latency (ms) including backend service time, $e_i^{(r)}$ the CPU package energy (Joules) attributed to processing $\ell_i$ (Section~\ref{s:energy-measurement} reference if defined), $d_i^{(r)} \in \{\text{mysql},\text{elk},\text{ipfs}\}$ the selected destination (after any compliance override), $s_i^{(r)} \in \{0,1\}$ a success indicator (backend accept), and $z_i \in \{0,1\}$ a router-agnostic sensitive classification flag. All metrics are reported both per-router and---for comparative plots/tables---side-by-side across routers.
+
+\paragraph{Latency Summary.}
+We report the central tendency and tail sensitivity.
+\[
+\text{MeanLatency}(r)=\frac{1}{N}\sum_{i=1}^{N} t_i^{(r)}, \quad
+\text{MedianLatency}(r)=\text{P}_{50}(\{t_i^{(r)}\}), \quad
+\text{P95Latency}(r)=\text{P}_{95}(\{t_i^{(r)}\})
+\]
+\noindent The $(\text{Median}, \text{P95})$ pair captures distribution skew and tail amplification beyond mean effects. For the plots, we retained the full empirical CDF or kernel density (depending on the figure) to visualize the shape differences between the adaptive and baseline strategies.
+
+\paragraph{Energy Metric.}
+Average per-log energy:
+\[
+\text{EnergyMean}(r)=\frac{1}{N}\sum_{i=1}^N e_i^{(r)}.
+\]
+When hardware RAPL sampling is unavailable (all-zero traces), we still retain the column but mark an acquisition flag in the experiment metadata so that numerical zeros are not misconstrued as ideal efficiency. Where appropriate, we compute an energy-latency scalarized cost (weight $\lambda$ fixed ex ante) but emphasize disaggregated reporting to avoid masking divergent trade-offs.
+
+\paragraph{Destination Mix.}
+Let $\pi_b(r) = \frac{1}{N}\sum_{i=1}^N \mathbf{1}[d_i^{(r)}=b]$ for $b \in \{\text{mysql},\text{elk},\text{ipfs}\}$. Shifts in $\pi_{\text{ipfs}}$ quantify archival/integrity emphasis; changes in $\pi_{\text{elk}}$ capture analytical routing demand; $\pi_{\text{mysql}}$ reflects performance-tier load.
+
+\paragraph{Success Reliability.}
+\[
+\text{SuccessRate}(r)=\frac{1}{N}\sum_{i=1}^N s_i^{(r)}.
+\]
+Although backend insertion failures are rare in practice, the metric bounds pathological policies that would trade correctness for cost.
+
+\paragraph{Variance \& Confidence Intervals.}
+For repeated runs (multiple seeds or dataset folds), we treat each run $k$ as yielding an estimate $\hat{\mu}_k$ (e.g., mean latency). The reported overall mean is $\bar{\mu} = \frac{1}{K}\sum_k \hat{\mu}_k$ with (when $K\ge 2$) a $95\%$ t-interval:
+\[
+\text{CI}_{95} = t_{0.975, K-1} \cdot \frac{\sigma_{\hat{\mu}}}{\sqrt{K}}, \quad 
+\sigma_{\hat{\mu}}^2 = \frac{1}{K-1}\sum_k (\hat{\mu}_k - \bar{\mu})^2.
+\]
+We avoid overlapping CI visual clutter on percentile metrics (which are nonlinear functionals) and instead show violin or layered CDFs.
+
+\paragraph{Tail Behavior Emphasis.}
+Given operational SLO relevance, p95 is the primary tail statistic; p99 is optionally computed but not emphasized when sample size $N$ renders it too noisy (heuristic: hide p99 if $N < 5{,}000$ and router latencies show multimodal variance).
+
+\paragraph{Streaming Implementation.}
+Aggregation traverses per-log CSVs once, computing sums and storing latencies in an array (size $N$ manageable at the experimental scale). For larger deployments, the same formulas admit approximate quantile sketches (Greenwald--Khanna) without altering definitions.
+
+\subsection{Compliance Metrics Interpretation}
+\label{s:eval-compliance}
+Compliance evaluation contextualizes governance, overhead, and protective coverage. Let sets:
+\[
+S = \{ i : z_i = 1\}, \qquad \bar{S} = \{ i : z_i = 0\}.
+\]
+For router $r$, with final (post-override) destination $d_i^{(r)}$:
+\[
+\text{SensitiveCoverage}(r) = \frac{\sum_{i \in S} \mathbf{1}[d_i^{(r)} = \text{ipfs}]}{|S|}, \quad
+\text{Leakage}(r)= \sum_{i \in S} \mathbf{1}[d_i^{(r)} \ne \text{ipfs}],
+\]
+\[
+\text{LeakageRate}(r)=\frac{\text{Leakage}(r)}{|S|}, \quad
+\text{NonSensitiveIPFSFrac}(r)=\frac{\sum_{i \in \bar{S}} \mathbf{1}[d_i^{(r)}=\text{ipfs}]}{|\bar{S}|}, \quad
+\text{ComplianceScore}(r)=\mathbf{1}[\text{Leakage}(r)=0].
+\]
+
+\paragraph{Interpretive Axes.}
+\begin{enumerate}
+  \item \textbf{Integrity Guarantee}: $\text{ComplianceScore}=1$ enforces zero leakage---a hard constraint, not an optimization objective.
+  \item \textbf{Selectivity Cost}: Elevated \text{NonSensitiveIPFSFrac} indicates potential over-conservatism (unnecessary immutable storage usage).
+  \item \textbf{Latency/Energy Overhead Attribution}: The difference in (MeanLatency, EnergyMean, $\pi_{\text{ipfs}}$) between paired baseline and compliance runs (Section~\ref{s:orchestration-compliance-pairing}) isolates governance impact.
+  \item \textbf{Trade-off Envelope}: Plotting $\Delta \text{MeanLatency}$ vs.\ $\Delta \pi_{\text{ipfs}}$ locates routers on an overhead frontier—efficient policies dominate when they achieve high coverage (always 1 under hard enforcement) with minimal cost increase.
+\end{enumerate}
+
+\paragraph{Failure Modes.}
+Any $\text{Leakage}(r)>0$ triggers experimental flagging; delta metrics for that router are discarded (fairness principle: only leak-free compliance comparisons are valid). A nonzero leakage implies pattern set insufficiency or regression in the override logic.
+
+\paragraph{Governance vs Optimization Separation.}
+Routers first produce a \ emph{raw}decision; compliance intercepts only afterward. Thus, learning objectives remain unbiased (no reward shaping distortion), ensuring that the reported compliance cost is an externally imposed constraint rather than an internalized behavior drift.
+
+\subsection{Fairness Considerations (Frozen RL vs Adaptive CBR)}
+\label{s:eval-fairness}
+Ensuring an equitable comparison across heterogeneous routing paradigms (offline RL vs. online adaptive heuristics) requires explicit guardrails:
+
+\paragraph{Frozen vs Online Learning.}
+The Q-learning and A2C policies were frozen during the evaluation (weights, Q-table, PCA/binning, and scaler immutable). CBR is intrinsically online; its adaptation \emph{is} an inference mechanism. Freezing CBR would negate its design goal; conversely allowing RL to continue updating would introduce non-stationary evaluation bias. Therefore:
+\[
+\text{Train Phase (RL)} \;\;\Rightarrow\;\; \text{Freeze} \quad;\quad \text{Eval Phase (CBR)} \;\;\Rightarrow\;\; \text{Online Update}.
+\]
+This asymmetry is acknowledged and justified, and the reported metrics reflect the intended operational mode of each method.
+
+\paragraph{Identical Input Stream.}
+All routers consume the same ordered log sequence (identical dataset files, sampling strategy, and deterministic iteration). No router is advantaged by a different distribution slice; stochastic variation arises solely from internal decision making (none for frozen RL).
+
+\paragraph{Uniform System State Context.}
+System metrics collected at decision time (part of the observation vector) are measured once per log event so that the RL and Static/CBR paths leverage the same transient conditions (CPU load, memory indicators, etc.) without timing skew.
+
+\paragraph{Instrumentation Neutrality.}
+Latency timing includes router decision overhead \emph{and} backend persistence; therefore, methods with heavier feature transforms incur their genuine inference costs. Energy metering windows wrap the full routing + backend action; no method receives unmetered preprocessing.
+
+\paragraph{Artifact Compatibility Enforcement.}
+If structural changes (e.g., embedding dimensionality) would silently degrade an RL policy, orchestrator retraining is triggered (Section~\ref{s:orchestration-unified-pipeline}) rather than permitting suboptimal legacy artifacts, preventing biased underperformance.
+
+\paragraph{Paired Compliance Deltas.}
+The compliance impact is computed via paired evaluations differing only by the enforcement flag; the RL artifacts reused in both branches ensure delta purity (no retraining-induced variance).
+
+\paragraph{Statistical Consistency.}
+For any repeated-seed analyses (primarily RL training variability studies), we either (i) hold CBR fresh each time (reflecting realistic cold-start each deployment) or (ii) report clearly that a persistent CBR state file was reused (labelled) and never mixed states across runs without disclosure.
+
+\paragraph{Limitations.}
+Residual bias sources include: (a) potential advantage to CBR under temporal locality if the test stream orders clusters attribute values; (b) RL policies trained under one workload regime evaluated under slightly drifted conditions (distribution shift). Both are mitigated by dataset fingerprinting and (optionally) shuffling + fixed seed experiments (reported where applicable).
+
+\paragraph{Summary.}
+The fairness methodology codifies identical input distribution, frozen RL policy inference, honest instrumentation, compatibility revalidation, and paired compliance deltas. This scaffolding ensures that the observed performance differentials correspond to routing intelligence (or adaptation responsiveness) rather than experimental artifacts.
+ 
+\section{Validation \& Reproducibility}\label{s:validation-reproducibility}
+Ensuring that the reported performance, energy, and compliance outcomes are both \emph{valid} (they measure what is claimed) and \emph{reproducible} (they can be independently re-obtained under the stated conditions) is central to the credibility of this study. This section articulates the procedural and infrastructural controls that reduce threats to internal validity (measurement bias, configuration drift, and stochastic training variance) and external validity (hardware dependence and dataset sampling bias). We decompose our strategy into four pillars: (i) deterministic sampling and seeded pseudo‑randomness; (ii) containerized service orchestration with explicit capture of configuration and image digests; (iii) integrity safeguards for timing and energy instrumentation (latency wall‑clock isolation, RAPL domain verification, fallback flagging); and (iv) versioned metadata for all learned artifacts (state abstraction transformers, RL policies, adaptive router statistics) that enable compatibility checks and forensic traceability.
+
+\subsection{Deterministic Sampling \& Seeds}
+\label{subsec:deterministic_sampling}
+To eliminate avoidable variance arising from stochastic data ordering and algorithmic randomness, we enforced a unified seeding and sampling protocol across all experimental runs. Let $S_{\text{global}}$ denote the user-specified master seed (or recorded default). From this single scalar, we derive disjoint, reproducible sub-seeds by hashing with context tags (e.g., \texttt{hash}(``q\_learning''$\Vert S_{\text{global}}$)), ensuring the independence of pseudo-random streams while preserving determinism. Concretely:
+\begin{enumerate}
+  \item \textbf{Dataset Ordering:} For modes requiring random selection (e.g., balanced or uniform down-sampling), we first load the full ordered log list, then apply a deterministic permutation $\pi$ generated by a PRNG initialized with $S_{\text{data}}$. Any head/prefix truncation or stratified extraction (e.g., balanced by severity) operates on $\pi(\text{logs})$, yielding a reproducible subsequence.
+  \item \textbf{Reinforcement Learning (A2C / Q-Learning):} Three independent PRNGs (environment dynamics / observation noise, model parameter initialization, exploration policy) receive $S_{\text{env}}$, $S_{\text{model}}$, and $S_{\text{explore}}$ respectively, each derived from $S_{\text{global}}$. This separation prevents incidental coupling (e.g., identical parameter seeds altering exploration trajectories).
+  \item \textbf{State Abstraction Transformers:} Collection of warm-up observations (for scaler mean/std, PCA fit, discretization bin edges) operates on the deterministically sampled log prefix; thus the learned transformation $\mathcal{T}$ is a pure function of $(S_{\text{global}}, \text{dataset version}, \text{feature extraction code hash})$.
+  \item \textbf{Online CBR Adaptation:} Although CBR is inherently online, the decision stream it processes is the same deterministic log order used for all routers, ensuring that observed divergence is attributable to method behavior rather than input reordering.
+  \item \textbf{Plateau / Adaptive Schedules:} Adaptive epsilon (Q-Learning) and entropy / LR schedules (A2C) consume only deterministic aggregated statistics (episode rewards at fixed evaluation intervals). Given identical seeds and code, schedule transition points (e.g., plateau-triggered epsilon drops) occurred at identical episodes.
+\end{enumerate}
+\paragraph{Recorded Provenance.} Each per-run metadata JSON persists: (i) $S_{\text{global}}$, (ii) derived sub-seeds, (iii) dataset filename plus a content hash (SHA-256) of the consumed CSV slice, (iv) counts of warm-up samples, and (v) feature extractor version (Git commit + embedding model identifier). This tuple suffices to reconstruct the exact input tensor sequence presented to each policy. If any incompatibility is detected at the load time (e.g., mismatch between the stored $\text{obs\_dim}$ and the current feature pipeline output), the system invalidates the artifact and triggers retraining (logged explicitly) rather than proceeding silently with misaligned state representations.
+\subsection{Containerized Services \& Config Capture}
+\label{subsec:containerization_config_capture}
+To prevent configuration drift across experimental sessions and enable third parties to recreate the exact service environment, all stateful infrastructure components (MySQL, Elasticsearch/Logstash/Kibana (ELK), and the IPFS daemon) are launched via a declarative \texttt{docker-compose. yml}. This yields three reproducibility benefits: (i) immutable base images (tag + digest) pin library versions beneath the application layer, (ii) explicit, versioned environment variable settings and port mappings document externally visible service contracts, and (iii) isolated namespaces eliminate interference from host‐level transient processes. We adopted the following capture and verification pipeline:
+
+\paragraph{Image Digest Freezing.} For each service image $I$ (for example, \texttt{mysql:8.0}, \texttt{elasticsearch:8. x}, \texttt{ipfs/go-ipfs:latest}), the resolved content digest $d(I)$ was recorded at the start of the experiment. The metadata file emits the tuple $(I, d(I))$; if a subsequent run resolves a different digest for the same tag, a warning is generated, and the new digest is appended, preserving an auditable chain.
+
+\paragraph{Deterministic Service Startup.} Containers are created in a fixed order, and the orchestrator blocks until the health checks (e.g., MySQL TCP connect and Elasticsearch cluster green) succeed. A start barrier ensures that the initial latency measurements are not affected by delayed index creation or JIT warm-up. The elapsed stabilization time $t_{\text{stabilize}}$ was stored in the experimental metadata.
+
+\paragraph{Configuration Snapshot.} Immediately after all services report healthy, the system exports:
+\begin{itemize}
+  \item MySQL: \texttt{SHOW VARIABLES} subset (buffer pool size, collation, isolation level).
+  \item Elasticsearch: cluster settings and index mappings for log indices (queried via REST).
+  \item IPFS: \texttt{ipfs config show} (filtered to non-secret keys).
+\end{itemize}
+Each snapshot is hashed (SHA-256) to produce $h_{\text{mysql}}, h_{\text{es}}, h_{\text{ipfs}}$; these hashes are embedded in the run metadata JSON. Full raw snapshots are optionally written to a \texttt{config\_snapshots/} directory for forensic comparison (disabled by default to keep the repositories lightweight).
+
+\paragraph{Resource Constraints and Isolation.} The CPU (cpuset/quota) and memory limits declared in the compose file bound cross-run variability from host contention. When limits are absent (user override), a flag \texttt{resource\_constraints=false} is emitted, indicating that latency comparability may be weakened.
+
+\paragraph{Clock and Timezone Normalization.} All containers inherit UTC to avoid time zone-induced timestamp shifts in the logs. The host monotonic clock is queried for latency instrumentation, and container wall times are used only for log timestamp echoing, making cross-container drift inconsequential.
+
+\paragraph{Failure Transparency.} Any container restart event or non-zero exit during an experimental window is trapped and recorded with $(\text{service}, t_{\text{restart}}, \text{exit\_code})$. Runs with mid-experiment restarts were labeled \texttt{unstable=true} in the metadata, allowing exclusion in the aggregate statistical analyses.
+
+\paragraph{Reconstruction Contract.} Given the artifacts: (i) \texttt{docker-compose. yml} (versioned in VCS), (ii) image digest list, (iii) configuration snapshot hashes, and (iv) global seed, an independent researcher can reconstruct an equivalent service layer. A mismatch in any hash during reconstruction constitutes provenance divergence and should be reported in replication studies.
+
+This disciplined capture of container image identity and live configuration mitigates threats arising from silent upstream image updates, mutable runtime defaults, and opaque service reinitialization behavior.
+\subsection{Integrity of Timing \& Energy Measurements}
+\label{subsec:timing_energy_integrity}
+Accurate latency and energy attribution underpin every comparative claim; any systemic bias propagates into cost and efficiency conclusions. Therefore, we isolate three potential threat surfaces—(i) clock source instability, (ii) contention/interference, and (iii) hardware counter misuse—and implement layered safeguards.
+
+\paragraph{Monotonic Timing Source.} All per-log latencies are measured using a high-resolution monotonic clock (POSIX \texttt{CLOCK\_MONOTONIC\_RAW} or platform equivalent) rather than wall-clock time to eliminate effects from NTP adjustments or leap seconds. Each latency sample $\ell_i$ is computed as a single span (start/end) surrounding the full routing + backend write pipeline, thereby avoiding multi-fragment accumulation drift.
+
+\paragraph{Synchronous Measurement Envelope.} The critical section for a log $i$—from pre-routing feature extraction through backend client acknowledgment—is bracketed; any asynchronous post-write tasks (e.g., JSON diagnostic dump, background scaler fitting) are executed outside this envelope to prevent artificial inflation of $\ell_i$. When unavoidable background work (e.g., periodic checkpoint writing) overlaps, the event is logged with its timestamp so that sensitivity analyses can exclude the affected windows.
+
+\paragraph{Warm-Up Exclusion.} Just-in-time (JIT) effects (Python module imports, initial DB connection pooling, Elasticsearch JVM warm-up) predominantly affect the first $N_{warm}$ operations. We record a stabilization boundary $B$ (empirically determined by the convergence of a rolling median latency within 5\% over a 200-operation window) and flag early span samples ($i < B$). Summary statistics used for comparative plots exclude flagged warm-up unless explicitly noted; raw CSVs retain them for their transparency.
+
+\paragraph{RAPL Domain Validation.} The energy measurements rely on the Intel RAPL package counters. At meter initialization, we enumerate the available domains; if the required package domain is absent or read attempts return non-increasing values, the run is annotated with \texttt{energy\_supported=false}. In such cases, the per-log energy defaults to 0.0 J, but a mandatory caveat column \texttt{energy\_valid=false} allows downstream aggregation to (a) ignore or (b) segregate zero-filled rows, preventing silent bias.
+
+\paragraph{Per-Log Energy Attribution.} We adopt a differential snapshot method: for log $i$ we capture cumulative Joules $E_{pre}$ immediately before entering the critical section and $E_{post}$ immediately after. The incremental energy $\Delta E_i = \max(0, E_{post} - E_{pre})$ is attributed to the log. Negative or implausibly large outliers (beyond $\mu + 6\sigma$ over a sliding window) trigger a re-sampling attempt; persistent anomalies are recorded in an \texttt{energy\_anomalies} list within the metadata.
+
+\paragraph{Clock / Counter Drift Checks.} Every $K$ operations (default $K=500$), we:
+\begin{enumerate}
+  \item Sample wall-clock and monotonic timestamps to ensure drift remains within a bounded tolerance (e.g., $<5$ ms difference in delta over the interval).
+  \item Read the RAPL counter twice in rapid succession to verify monotonic advancement (difference $>0$). Failure increments a \texttt{rapl\_stall\_count}.
+\end{enumerate}
+A non-zero final \texttt{rapl\_stall\_count} is emitted, indicating potential under-at
+
+\paragraph{Low-Noise Host Assumption.} No co-resident high-load processes were intentionally launched during the measurements. CPU frequency scaling governors are set to \texttt{performance} (when permitted), and this fact is recorded (\texttt{scaling\_governor=performance}); if the governor differs, we emit \texttt{governor\_warning=true}. This makes any increased variance risk explicit.
+
+\paragraph{Energy + Latency Coupling Awareness.} Because energy attribution is differential, longer latency operations naturally accrue higher energy, even in the absence of additional work. For analysis, we compute Pearson correlation $\rho(\{\ell_i\}, \{\Delta E_i\})$; unusually high $\rho$ (e.g., $>0.95$ across all routers) could indicate either (i) genuine CPU-bound uniform workload, or (ii) insufficient measurement granularity. The correlation value was reported to contextualize the combined cost interpretations.
+
+\paragraph{Reproducibility Contract.} Provided (a) raw per-log traces with flags (\texttt{warmup}, \texttt{energy\_valid}, anomalies), (b) monotonic vs wall-clock drift summary, and (c) metadata with RAPL support status and stall counts, an auditor can (i) recompute all aggregate statistics and (ii) detect any exclusion manipulations. No aggregate value in the manuscript relies on the unpublished transformation of these raw fields.
+
+This multilayer instrumentation strategy constrains systematic errors, explicitly surfaces residual uncertainty, and preserves the ability to perform independent re-analysis without privileged access to ephemeral runtime states.
+\subsection{Artifact Metadata \& Versioning}
+\label{subsec:artifact_metadata_versioning}
+Robust reproducibility requires that every learned or adaptive component be self-describing; an artifact must encode not only its parameters but also the provenance needed to validate structural compatibility and interpret performance. We codify this via explicit versioned metadata schemas per artifact class, forward-compatible loading with graceful invalidation, and cryptographic hashing of critical binary blobs.
+
+\paragraph{Artifact Classes.} The system produces four principal artifact families.
+\begin{enumerate}
+  \item \textbf{Q-Learning Bundle} (version 3): \texttt{\_q\_table.pkl}, scaler (\texttt{\_scaler.pkl}), PCA transformer (\texttt{\_pca.pkl}), discretizer (\texttt{\_binner.pkl}), and \texttt{\_metadata.json}.
+  \item \textbf{A2C Policy} (version 1): Stable-Baselines3 model (\texttt{.zip}), optional scaler (\texttt{\_scaler.pkl}), and \texttt{\_metadata.json}.
+  \item \textbf{CBR State} (version 1, optional): Attribute bucket statistics snapshot (\texttt{cbr\_state.json}) plus inline header fields.
+  \item \textbf{Experiment Aggregates} (version 1): Combined summary CSV / Markdown plus \texttt{experiment\_metadata\_<dataset>.json}.
+\end{enumerate}
+
+\paragraph{Schema Principles.} Each metadata JSON contains (i) a monotonically increasing integer \texttt{version}; (ii) structural descriptors (e.g., \texttt{obs\_dim}, \texttt{embedding\_dim}, PCA components, bin counts); (iii) training/runtime hyperparameters; (iv) statistical summaries (reward moments, epsilon/entropy schedule endpoints); (v) reproducibility anchors (global seed, git commit hash, dataset filename + content hash); and (vi) optional adaptive event logs.
+
+\paragraph{Forward Compatibility \& Invalidation.} Under load, the router validates
+\begin{enumerate}
+  \item \emph{Dimensional Consistency:} Stored \texttt{obs\_dim} must match the current feature extractor output length. Mismatch $\Rightarrow$ artifact rejection.
+  \item \emph{Embedding Subspace Stability:} If \texttt{embedding\_dim} differs (e.g., model upgrade 768$\rightarrow$1024), dependent transforms (scaler, PCA, bins) are deemed stale; automatic fallback to baseline routing is triggered and a retraining flag is emitted.
+  \item \emph{Version Support:} Loader advertises a supported version range $[v_{\min}, v_{\max}]$. Artifacts with $v < v_{\min}$ raise a hard incompatibility (require migration script); artifacts with $v > v_{\max}$ raise a warning (attempted optimistic parse if backward compatible fields exist).
+\end{enumerate}
+
+\paragraph{Hashing \& Integrity.} For binary components (Q-table, PCA, scaler, discretizer, and A2C weights), we compute SHA-256 digests at creation time and store them in metadata under a \texttt{hashes} map keyed by logical name. On load, the digest is recomputed; mismatch sets \texttt{integrity\_verified=false} and aborts use (protecting against silent partial file corruption or accidental edits).
+
+\paragraph{Adaptive Event Logging.} Q-learning adaptive epsilon drops and A2C entropy / learning rate schedule milestones are recorded as ordered event lists: each entry $\langle t, \text{type}, \text{value} \rangle$ where $t$ is episode or timestep. This allows the reconstruction of the dynamic exploration temperature without rerunning the training.
+
+\paragraph{Minimal Sufficient Provenance Tuple.} For an RL policy, the tuple
+\[
+\left( \texttt{version}, \texttt{obs\_dim}, \texttt{embedding\_dim}, \texttt{policy\_arch\_hash}, \texttt{hyperparams\_hash}, \texttt{dataset\_hash}, \texttt{git\_commit}, \texttt{seed} \right)
+\]
+is mathematically sufficient to (a) detect structural mismatches, (b) map reward values to the correct scaling, and (c) differentiate this artifact from any other produced by the framework. We additionally include human-readable mirrors of architectural lists (e.g., hidden layer sizes) to support the manual inspection.
+
+\paragraph{Migration Strategy.} Incrementing a schema version accompanies a documented CHANGELOG entry describing field additions/removals. A lightweight migration utility can up-convert $v \rightarrow v+1$ when the changes are additive (e.g., new optional statistics). Non-additive (breaking) changes require retraining, and the system explicitly refuses silent lossy conversion.
+
+\paragraph{Graceful Degradation.} If an artifact fails any critical check, the runtime substitutes a deterministic fallback (static heuristic policy) instead of operating with an undefined behavior. A telemetry field \texttt{router\_degraded=true} is injected into per-log CSVs, enabling post-hoc filtering of degraded spans.
+
+\paragraph{Reconstruction Guarantee.} Given the metadata JSON, the exact source revision (git commit), and the raw artifact binaries (whose digests match), an independent party can reinstantiate the identical inference pipeline (including scaler and PCA transforms) and verify the deterministic action selection for a fixed observation sequence. Divergence implies either (i) non-deterministic upstream dependencies (flagged) or (ii) unrecorded environmental variability, both of which are counted as reproducibility defects.
+
+\paragraph{Retention Policy.} Intermediate (checkpoint) A2C models record their own hashes; the metadata notes \texttt{num\_checkpoints}. Old checkpoints may be pruned; their digests persist, so a later absence is distinguishable from a hash mismatch (preventing false integrity alarms).
+
+This rigorous, versioned metadata architecture sharply limits silent failure modes (dimension drift, file corruption, undocumented hyperparameter changes) and supplies the cryptographic evidence necessary for third-party replication and forensic audits.

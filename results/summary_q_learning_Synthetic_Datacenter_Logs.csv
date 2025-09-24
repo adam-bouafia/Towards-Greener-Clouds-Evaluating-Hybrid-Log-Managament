@@ -1,0 +1,2 @@
+router,dataset_name,LogsProcessed,TotalEnergyWh,EnergyPerLogWh,CarbonEmissionsKg,AvgLatencyMs,ThroughputLogsPerSec,EmissionsFactorKgPerKWh,ComplianceEnabled,CompliancePatterns
+q_learning,Synthetic_Datacenter_Logs,200000,5.933712801388889,2.9668564006944448e-05,1.3825550827236113,6.248860843521834,156.93355879598988,0.233,False,

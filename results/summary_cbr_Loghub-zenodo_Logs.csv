@@ -1,2 +1,2 @@
 router,dataset_name,LogsProcessed,TotalEnergyWh,EnergyPerLogWh,CarbonEmissionsKg,AvgLatencyMs,ThroughputLogsPerSec,EmissionsFactorKgPerKWh,ComplianceEnabled,CompliancePatterns
-cbr,Loghub-zenodo_Logs,14000,0.014408751944444445,1.0291965674603175e-06,0.003357239203055556,0.16278688877771078,4229.660944308026,0.233,True,sessionid;token;secret key;permission denied;login;/home/
+cbr,Loghub-zenodo_Logs,14000,0.3912523738888889,2.7946598134920635e-05,0.09116180311611112,5.826420924763495,169.08977029490975,0.233,False,

@@ -1,0 +1,5 @@
+# Combined Summary (Synthetic_Datacenter_Logs)
+
+| dataset_name | rows | mean_total_latency_ms | median_total_latency_ms | p95_total_latency_ms | success_rate | sensitive_fraction | energy_per_log_j | destination_mix_mysql | destination_mix_elk | destination_mix_ipfs | sensitive_total | sensitive_to_ipfs | sensitive_coverage | sensitive_leakage | leakage_rate | non_sensitive_ipfs_fraction | compliance_score |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Synthetic_Datacenter_Logs | 1200000 | 4.7908928710303735 | 13.574482494732365 | 0.12162104831107151 | 1.0 | 0.0 | 0.09373362256916666 | 0.4236933333333333 | 0.40964 | 0.16666666666666666 | 0 | 0 | 1.0 | 0 | 0.0 | 0.16666666666666666 | 1.0 |

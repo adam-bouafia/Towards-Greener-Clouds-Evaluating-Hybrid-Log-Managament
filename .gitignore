@@ -202,8 +202,8 @@ docker-compose.override.yml
 # ----------------------
 # Experiment Artifacts (optional ignore)
 # ----------------------
-run_showcase.sh
-results/showcase_*/
-runs/
-trained_models/*.tmp
-*.checkpoint.zip
+#run_showcase.sh
+#results/showcase_*/
+#runs/
+#trained_models/*.tmp
+#*.checkpoint.zip

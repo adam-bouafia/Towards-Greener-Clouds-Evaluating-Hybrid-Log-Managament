@@ -1,0 +1,78 @@
+{
+  "dataset_name": "Synthetic_Datacenter_Logs",
+  "start_time": 1758738410.7540376,
+  "routers_requested": "all",
+  "force_retrain": false,
+  "routers": [
+    "a2c",
+    "cbr",
+    "q_learning",
+    "direct_mysql",
+    "direct_elk",
+    "direct_ipfs"
+  ],
+  "training": {
+    "q_learning": true,
+    "a2c": true
+  },
+  "evaluation": [
+    {
+      "router": "a2c",
+      "status": "ok",
+      "perlog_csv": "/home/neo/Documents/hybrid-log-management/results/a2c_Synthetic_Datacenter_Logs.csv",
+      "summary_csv": "/home/neo/Documents/hybrid-log-management/results/summary_a2c_Synthetic_Datacenter_Logs.csv"
+    },
+    {
+      "router": "cbr",
+      "status": "ok",
+      "perlog_csv": "/home/neo/Documents/hybrid-log-management/results/cbr_Synthetic_Datacenter_Logs.csv",
+      "summary_csv": "/home/neo/Documents/hybrid-log-management/results/summary_cbr_Synthetic_Datacenter_Logs.csv"
+    },
+    {
+      "router": "q_learning",
+      "status": "ok",
+      "perlog_csv": "/home/neo/Documents/hybrid-log-management/results/q_learning_Synthetic_Datacenter_Logs.csv",
+      "summary_csv": "/home/neo/Documents/hybrid-log-management/results/summary_q_learning_Synthetic_Datacenter_Logs.csv"
+    },
+    {
+      "router": "direct_mysql",
+      "status": "ok",
+      "perlog_csv": "/home/neo/Documents/hybrid-log-management/results/direct_mysql_Synthetic_Datacenter_Logs.csv",
+      "summary_csv": "/home/neo/Documents/hybrid-log-management/results/summary_direct_mysql_Synthetic_Datacenter_Logs.csv"
+    },
+    {
+      "router": "direct_elk",
+      "status": "ok",
+      "perlog_csv": "/home/neo/Documents/hybrid-log-management/results/direct_elk_Synthetic_Datacenter_Logs.csv",
+      "summary_csv": "/home/neo/Documents/hybrid-log-management/results/summary_direct_elk_Synthetic_Datacenter_Logs.csv"
+    },
+    {
+      "router": "direct_ipfs",
+      "status": "ok",
+      "perlog_csv": "/home/neo/Documents/hybrid-log-management/results/direct_ipfs_Synthetic_Datacenter_Logs.csv",
+      "summary_csv": "/home/neo/Documents/hybrid-log-management/results/summary_direct_ipfs_Synthetic_Datacenter_Logs.csv"
+    }
+  ],
+  "combined_summary": {
+    "dataset_name": "Synthetic_Datacenter_Logs",
+    "rows": 1200000,
+    "mean_total_latency_ms": 2.99966392171608,
+    "median_total_latency_ms": 13.077550480375066,
+    "p95_total_latency_ms": 0.13765049225221807,
+    "success_rate": 1.0,
+    "sensitive_fraction": 0.27894,
+    "energy_per_log_j": 0.061510576531666666,
+    "destination_mix_mysql": 0.33070916666666667,
+    "destination_mix_elk": 0.15000083333333333,
+    "destination_mix_ipfs": 0.51929,
+    "sensitive_total": 334728,
+    "sensitive_to_ipfs": 334728,
+    "sensitive_coverage": 1.0,
+    "sensitive_leakage": 0,
+    "leakage_rate": 0.0,
+    "non_sensitive_ipfs_fraction": 0.3333287105095276,
+    "compliance_score": 1.0
+  },
+  "end_time": 1758742161.987033,
+  "elapsed_sec": 3751.2329952716827
+}
