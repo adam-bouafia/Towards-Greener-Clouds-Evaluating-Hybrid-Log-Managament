@@ -186,7 +186,7 @@ DerivedData/
 # ----------------------
 *.log
 *.gz
-*.zip
+#.zip
 *.tar
 *.7z
 *.bak
@@ -207,3 +207,4 @@ docker-compose.override.yml
 #runs/
 #trained_models/*.tmp
 #*.checkpoint.zip
+*.tex
