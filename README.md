@@ -251,13 +251,6 @@ BLOCKCHAIN_SIMULATION_MODE = True  # Simulation mode for testing
 - `scikit-learn>=1.3.0` - Train/test split, metrics
 - `pandas>=2.0.0`, `numpy>=1.24.0` - Data processing
 
-## 🤝 Contributing
-
-This is a thesis project. For questions or collaboration:
-- Review `SUPERVISOR_ASSESSMENT.md` for architectural decisions
-- Check open issues for known limitations
-- Follow the 6-week implementation roadmap
-
 ## 📝 License
 
 Academic research project - see institution guidelines.
