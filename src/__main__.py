@@ -8,58 +8,12 @@ import re
 
 import psutil
 
-from .backends import BackendManager
+from .backends import ClickHouseBackend, MinIOBackend
 from .config import MYSQL_DATABASE, MYSQL_ROOT_PASSWORD
-from .log_provider import LogProvider
-from .metrics import EnergyMeter
-from .routers import StaticRouter, QLearningRouter, A2CRouter, DirectRouter, CBRRouter
+from .utils.log_provider import LogProvider
+from .routers import XGBoostRouter, DirectRouter
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-SENSITIVE_LEVELS = {"error", "crit", "alert", "emerg"}  # retained legacy heuristic (may be superseded)
-DEFAULT_COMPLIANCE_PATTERNS = [
-    "sessionid",  # session identifiers
-    "token",       # access / job / security tokens
-    "secret key",  # explicit key reference
-    "permission denied",  # auth failures
-    "login",       # authentication events
-    "/home/",      # user home paths -> potential user identification
-]
-
-
-def build_sensitive_matcher(user_patterns: list[str] | None):
-    # Merge user patterns with defaults, keeping order & uniqueness (case-insensitive comparison)
-    pats: list[str] = []
-    for src in [DEFAULT_COMPLIANCE_PATTERNS, user_patterns or []]:
-        for p in src:
-            q = p.strip()
-            if not q:
-                continue
-            if q.lower() not in {x.lower() for x in pats}:
-                pats.append(q)
-    lowered = [p.lower() for p in pats]
-
-    # Precompile simple substring matcher; regex not required unless patterns contain anchors.
-    def _matcher(log: dict) -> bool:
-        content_full = " ".join(
-            [
-                str(log.get("Content", "")),
-                str(log.get("EventTemplate", "")),
-                str(log.get("Component", "")),
-            ]
-        ).lower()
-        lvl = str(log.get("Level", "")).lower()
-
-        # Level-based legacy heuristic (kept for possible critical security/error escalations)
-        if lvl in SENSITIVE_LEVELS:
-            return True
-
-        for pat in lowered:
-            if pat in content_full:
-                return True
-        return False
-
-    return _matcher, pats
 
 
 def _normalize_model_base(p: str | None) -> str:
@@ -79,6 +33,11 @@ def _normalize_model_base(p: str | None) -> str:
 
 
 def _build_router(name: str, model_path: str, **kwargs):
+    if name == "unified":
+        base = model_path or "trained_models/unified_router"
+        if not os.path.isabs(base):
+            base = os.path.join(PROJECT_ROOT, base)
+        return UnifiedRouter(model_path=base)
     if name == "static":
         return StaticRouter()
     if name == "q_learning":
@@ -108,7 +67,7 @@ def main():
         "--router",
         type=str,
         required=True,
-        choices=["static", "q_learning", "a2c", "cbr", "direct_mysql", "direct_elk", "direct_ipfs"],
+        choices=["unified", "static", "q_learning", "a2c", "cbr", "direct_mysql", "direct_elk", "direct_ipfs"],
         help="Routing algorithm to use",
     )
     parser.add_argument("--sample_mode", type=str, default="head",
@@ -172,7 +131,6 @@ def main():
     user_pattern_list = []
     if args.compliance_patterns:
         user_pattern_list = [p.strip() for p in args.compliance_patterns.split(',') if p.strip()]
-    sensitive_fn, effective_patterns = build_sensitive_matcher(user_pattern_list)
     meter = EnergyMeter()
     proc = psutil.Process(os.getpid())
 
@@ -197,19 +155,14 @@ def main():
             processed += 1
 
             payload_bytes = len((log_entry.get("Content") or "").encode("utf-8"))
-            sensitive = sensitive_fn(log_entry) if args.compliance_enable else False
+            sensitive = is_sensitive(log_entry, user_pattern_list) if args.compliance_enable else False
 
             t0 = time.perf_counter()
             raw_destination = router.get_route(log_entry)
             routing_latency_ms = (time.perf_counter() - t0) * 1000.0
 
             compliance_forced = False
-            # Hard override: enforce IPFS for sensitive logs when compliance enabled
-            if args.compliance_enable and sensitive and raw_destination != "ipfs":
-                destination = "ipfs"
-                compliance_forced = True
-            else:
-                destination = raw_destination
+            destination = raw_destination
 
             backend_write_latency_ms = 0.0
             success = True
@@ -234,11 +187,14 @@ def main():
                 else:
                     success = False
 
-                e = meter.stop()
+                e = meter.stop(proc)
                 backend_write_latency_ms = (time.perf_counter() - t1) * 1000.0
                 proc_cpu_pct = proc.cpu_percent(None)
                 if e:
                     energy_cpu_pkg_j = getattr(e, "cpu_pkg_j", 0.0)
+                    if e.system_cpu_cores > 0 and e.duration_s > 0:
+                        process_fraction = e.process_cpu_time_s / (e.duration_s * e.system_cpu_cores)
+                        energy_cpu_pkg_j *= min(1.0, max(0.0, process_fraction))
 
             except Exception as ex:
                 print(f"Error writing to backend {destination}: {ex}")
@@ -352,7 +308,7 @@ def main():
                 "ThroughputLogsPerSec": throughput,
                 "EmissionsFactorKgPerKWh": float(args.emissions_kg_per_kwh),
                 "ComplianceEnabled": args.compliance_enable,
-                "CompliancePatterns": ";".join(effective_patterns) if args.compliance_enable else "",
+                "CompliancePatterns": ";".join(user_pattern_list) if args.compliance_enable else "",
             }
         )
     print(f"Summary saved to {summary_path}")

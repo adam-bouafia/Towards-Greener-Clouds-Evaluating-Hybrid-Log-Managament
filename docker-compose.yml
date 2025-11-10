@@ -1,75 +1,47 @@
 services:
-  mysql:
-    image: mysql:8.0
-    container_name: mysql_db
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
     restart: unless-stopped
     environment:
-      MYSQL_USER: log_user
-      MYSQL_PASSWORD: your_strong_password
-      MYSQL_ROOT_PASSWORD: your_password
-      MYSQL_DATABASE: logs_db
+      - CLICKHOUSE_DB=logs
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
     ports:
-      - "3306:3306"
+      - "8123:8123" # HTTP interface
+      - "9000:9000" # Native interface
     volumes:
-      - db_data:/var/lib/mysql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ulog_user", "-pyour_strong_password"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
-    container_name: elasticsearch
-    restart: unless-stopped
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
-    ports:
-      - "9200:9200" 
+      - clickhouse_data:/var/lib/clickhouse
     ulimits:
-      memlock:
-        soft: -1
-        hard: -1
       nofile:
-        soft: 65536
-        hard: 65536
-    volumes:
-      - es_data:/usr/share/elasticsearch/data
+        soft: 262144
+        hard: 262144
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9200/"]
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 10s
       timeout: 5s
-      retries: 12
+      retries: 5
 
-  kibana:
-    image: docker.elastic.co/kibana/kibana:8.11.0
-    container_name: kibana
-    restart: unless-stopped
-    ports:
-      - "5601:5601"
-    depends_on:
-      elasticsearch:
-        condition: service_healthy
-
-  ipfs:
-    image: ipfs/kubo:latest
-    container_name: ipfs_node
+  minio:
+    image: minio/minio:latest
+    container_name: minio
     restart: unless-stopped
     environment:
-      - IPFS_PROFILE=server
-    command: ["daemon", "--migrate=true", "--enable-gc"]
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
     ports:
-      - "5001:5001"  # API
-      - "8080:8080"  # Gateway (optional)
-      - "4001:4001"  # Swarm (optional)
+      - "9003:9001" # Web UI (changed to 9003)
+      - "9002:9000" # API
     volumes:
-      - ipfs_data:/data/ipfs
-      - ipfs_staging:/export 
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
-  db_data:
-  es_data:
-  ipfs_data:
-  ipfs_staging:
+  clickhouse_data:
+  minio_data:
