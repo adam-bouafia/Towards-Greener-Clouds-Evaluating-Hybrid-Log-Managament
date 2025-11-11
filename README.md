@@ -30,7 +30,7 @@ This system uses **machine learning with semantic understanding** to intelligent
                     │  SemanticXGBoostRouter               │
                     │  - Trained XGBoost Classifier        │
                     │  - Binary: Hot (0) vs Cold (1)       │
-                    │  - Inference: ~5-8ms                 │
+                    │                                      │
                     └──────────────────┬───────────────────┘
                                        │ Backend decision
                                        ▼
