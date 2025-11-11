@@ -1,4 +1,4 @@
-# 🚀 Semantic ML Routing for Green Cloud Computing
+# Semantic ML Routing for Green Cloud Computing
 
 **Hybrid Log Management System with Intelligent Semantic Routing**
 
