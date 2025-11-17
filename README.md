@@ -51,6 +51,18 @@ This system uses **machine learning with semantic understanding** to intelligent
 
 ## 🔬 How It Works
 
+## 🔗 Blockchain Integration (Optional)
+
+We support optional, asynchronous blockchain verification for sensitive logs. The default setup for development uses a local Ganache instance; this provides deterministic accounts and instant blocks so experiments are reproducible and cheap.
+
+- Local (recommended for experiments): Ganache on port 8545
+- Production/Testnet: Any Polygon-compatible RPC (set via `POLYGON_RPC_URL`)
+
+Important notes:
+- Do NOT store private keys in repository files. `run_all_experiments.sh` now reads `BLOCKCHAIN_PRIVATE_KEY` from the environment.
+- A local draft with full deployment steps is available in `BLOCKCHAIN_EVAL_DRAFT.md` (this file is intentionally ignored by Git).
+
+
 ### Semantic ML Routing
 ```python
 # Extract semantic features from log content
@@ -149,27 +161,97 @@ hybrid-log-management/
 └── test_semantic_features.py           # Feature extraction tests
 ```
 
-## 🧪 Experiments & Evaluation
+## 🧪 Automated Experiments Framework
 
-### Baseline Comparisons
+### Quick Start - Run All Experiments
+
+**Option 1: Using Shell Script (Recommended)**
+```bash
+# Run all thesis experiments (automated)
+./run_experiments.sh --all
+
+# Quick test mode (1000 logs, ~10-15 minutes)
+./run_experiments.sh --all --quick
+
+# Run specific research question
+./run_experiments.sh --rq1  # Basic vs Semantic features
+./run_experiments.sh --rq2  # XGBoost accuracy analysis
+./run_experiments.sh --rq3  # ML vs baseline comparison
+./run_experiments.sh --rq4  # Blockchain overhead
+```
+
+**Option 2: Using Main CLI (Integrated)**
+```bash
+# Run all experiments through main CLI
+python -m src --run-experiments
+
+# Quick test mode
+python -m src --run-experiments --experiments-quick
+
+# Run specific research question
+python -m src --run-experiments --experiments-mode rq1
+python -m src --run-experiments --experiments-mode rq2
+python -m src --run-experiments --experiments-mode rq3
+python -m src --run-experiments --experiments-mode rq4
+
+# Custom output directory
+python -m src --run-experiments --experiments-output results/my_experiment
+```
+
+**What it does**:
+- Automatically trains all models (basic, semantic, baselines)
+- Runs experiments for all 4 research questions
+- Collects metrics (accuracy, cost, energy, latency)
+- Generates comprehensive reports in markdown and JSON
+- Creates thesis-ready comparison tables
+
+**Output**: `results/experiments_YYYYMMDD_HHMMSS/EXPERIMENT_REPORT.md`
+
+For detailed documentation, see **[EXPERIMENTS_README.md](EXPERIMENTS_README.md)**
+
+### Research Questions Addressed
+
+**RQ1: Basic vs. Semantic Features**
+- Compares 6 basic statistical features vs. 778 semantic features
+- Expected: +22.4% accuracy improvement (72% → 95%)
+
+**RQ2: XGBoost Routing Accuracy**
+- Analyzes routing distribution (25% hot, 75% cold)
+- Expected: >90% accuracy, 67.5% cost savings
+
+**RQ3: ML vs. Baseline Comparison**
+- Tests: Direct storage, Rule-based, CBR, XGBoost
+- Expected: XGBoost best (95% accuracy)
+
+**RQ4: Async Blockchain Performance**
+- Measures blockchain overhead
+- Expected: <1ms overhead, maintains <10ms latency
+
+### Manual Evaluation
+
+#### Baseline Comparisons
 
 1. **Direct ClickHouse** - All logs to hot storage
 2. **Direct MinIO** - All logs to cold storage
-3. **Semantic XGBoost** - Semantic features (778-dim) ← **Our approach**
+3. **Rule-based Router** - Static rules
+4. **CBR Router** - Case-based reasoning
+5. **Semantic XGBoost** - Semantic features (778-dim) ← **Our approach**
 
-### Metrics Evaluated
+#### Metrics Evaluated
 
 - **Accuracy**: Routing correctness vs ground truth
 - **Latency**: Time per routing decision (target: <10ms)
 - **Energy**: Power consumption (RAPL measurements)
 - **Cost**: Storage and compute costs
 
-### Expected Results
+#### Expected Results
 
 | Router | Accuracy | Latency | Energy | Cost |
 |--------|----------|---------|--------|------|
 | Direct CH | ~50% | 0.1ms | High | High |
 | Direct MinIO | ~50% | 0.1ms | Low | High |
+| Rule-based | ~72% | 0.5ms | Low | Medium |
+| CBR | ~76% | 2-3ms | Medium | Medium |
 | **Semantic XGB** | **~95%** | **5-8ms** | **Medium** | **Low** |
 
 ## 🔥 Key Features

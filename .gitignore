@@ -208,3 +208,11 @@ docker compose.override.yml
 #trained_models/*.tmp
 #*.checkpoint.zip
 *.tex
+
+# Local blockchain evaluation draft (do NOT commit)
+BLOCKCHAIN_EVAL_DRAFT.md
+
+# Local environment files
+.env
+*.key
+secrets/*.key
