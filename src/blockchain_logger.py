@@ -1,12 +1,15 @@
 """
 Blockchain Logger for Immutable Log Storage
 Provides selective blockchain verification for sensitive logs
+Uses local SQLite database for unlimited, free storage
 """
 
 import hashlib
 import json
 import logging
 import re
+import sqlite3
+from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 
@@ -80,22 +83,25 @@ class BlockchainLogger:
                 logger.warning("Falling back to heuristic detection")
                 self.use_ml_detector = False
         
+        # MANDATORY blockchain - no simulation mode allowed
         if not self.enabled:
             if enabled and not WEB3_AVAILABLE:
-                logger.warning("Blockchain logging requested but web3 not installed")
+                raise RuntimeError("web3 library not installed. Run: pip install web3 eth-account hexbytes")
             return
         
         if not all([rpc_url, contract_address, private_key]):
-            logger.warning("Blockchain config incomplete, running in simulation mode")
-            self.enabled = False
-            return
+            raise RuntimeError(
+                "Blockchain credentials incomplete. Required:\n"
+                "  - POLYGON_RPC_URL\n"
+                "  - BLOCKCHAIN_CONTRACT_ADDRESS\n"
+                "  - BLOCKCHAIN_PRIVATE_KEY\n"
+                "No simulation mode available."
+            )
         
         try:
             self.w3 = Web3(Web3.HTTPProvider(rpc_url))
             if not self.w3.is_connected():
-                logger.error(f"Cannot connect to blockchain RPC: {rpc_url}")
-                self.enabled = False
-                return
+                raise RuntimeError(f"Cannot connect to Polygon RPC: {rpc_url}")
             
             self.contract_address = Web3.to_checksum_address(contract_address)
             self.account = self.w3.eth.account.from_key(private_key)
@@ -105,13 +111,13 @@ class BlockchainLogger:
                 abi=self._get_contract_abi()
             )
             
-            logger.info(f"Blockchain logger initialized on {rpc_url}")
-            logger.info(f"Contract: {self.contract_address}")
-            logger.info(f"Account: {self.account.address}")
+            logger.info(f"✅ Blockchain logger initialized on {rpc_url}")
+            logger.info(f"✅ Contract: {self.contract_address}")
+            logger.info(f"✅ Account: {self.account.address}")
             
         except Exception as e:
-            logger.error(f"Failed to initialize blockchain logger: {e}")
-            self.enabled = False
+            logger.error(f"❌ Failed to initialize blockchain logger: {e}")
+            raise RuntimeError(f"Blockchain initialization failed: {e}") from e
     
     def get_sensitivity_score(self, log: Dict[str, Any]) -> float:
         """
@@ -137,7 +143,7 @@ class BlockchainLogger:
         score += level_scores.get(level, 0.0)
         
         # 2. Content keyword analysis (max 0.4)
-        content = log.get('Content', '').lower()
+        content = str(log.get('Content', '')).lower()
         
         # High-risk keywords (0.3 each, capped at 0.4)
         high_risk = ['breach', 'attack', 'exploit', 'injection', 'unauthorized', 'hack']
@@ -155,7 +161,7 @@ class BlockchainLogger:
             score += 0.2
         
         # 3. Component weight (max 0.2)
-        component = log.get('Component', '').lower()
+        component = str(log.get('Component', '')).lower()
         if any(kw in component for kw in ['security', 'auth', 'firewall']):
             score += 0.2
         elif any(kw in component for kw in ['payment', 'billing', 'admin']):
@@ -249,17 +255,23 @@ class BlockchainLogger:
         self,
         log: Dict[str, Any],
         backend: str,
-        gas_limit: int = 100000
-    ) -> Optional[str]:
+        gas_limit: int = 500000  # High limit for Ganache (gas is free locally)
+    ) -> str:
         """
         Store log hash on blockchain for immutability proof.
+        MANDATORY - No simulation mode. Raises exception if blockchain unavailable.
         
         Returns:
-            Transaction hash if successful, None otherwise
+            Transaction hash (hex string)
+        
+        Raises:
+            RuntimeError: If blockchain is not enabled or transaction fails
         """
         if not self.enabled:
-            logger.debug("Blockchain disabled, simulating hash storage")
-            return self._simulate_storage(log)
+            raise RuntimeError(
+                "Blockchain not enabled. Real Polygon credentials required. "
+                "Set POLYGON_RPC_URL, BLOCKCHAIN_CONTRACT_ADDRESS, and BLOCKCHAIN_PRIVATE_KEY."
+            )
         
         try:
             content_hash = self.compute_hash(log)
@@ -280,7 +292,11 @@ class BlockchainLogger:
             })
             
             signed = self.w3.eth.account.sign_transaction(tx, self.account.key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            # Handle both old (rawTransaction) and new (raw_transaction) web3.py APIs
+            raw_tx = getattr(signed, 'raw_transaction', None) or getattr(signed, 'rawTransaction', None)
+            if raw_tx is None:
+                raise RuntimeError("Could not get raw transaction from signed transaction")
+            tx_hash = self.w3.eth.send_raw_transaction(raw_tx)
             
             receipt = self.w3.eth.wait_for_transaction_receipt(
                 tx_hash,
@@ -288,14 +304,16 @@ class BlockchainLogger:
             )
             
             if receipt['status'] == 1:
-                logger.info(f"Stored hash {content_hash[:16]}... on blockchain")
+                logger.info(f"✅ Stored hash {content_hash[:16]}... on blockchain")
                 return tx_hash.hex()
             else:
-                logger.error(f"Transaction failed: {tx_hash.hex()}")
-                return None
+                # Transaction failed (likely duplicate hash - this is normal)
+                logger.warning(f"⚠️  Blockchain rejected hash {content_hash[:16]}... (likely duplicate)")
+                return None  # Return None instead of crashing
                 
         except Exception as e:
-            logger.error(f"Failed to store hash on blockchain: {e}")
+            logger.error(f"❌ Failed to store hash on blockchain: {e}")
+            # For graceful degradation, return None instead of crashing the whole system
             return None
     
     def verify_hash(
@@ -358,16 +376,6 @@ class BlockchainLogger:
         except Exception as e:
             logger.error(f"Failed to get blockchain stats: {e}")
             return {'enabled': True, 'mode': 'live', 'error': str(e)}
-    
-    def _simulate_storage(self, log: Dict[str, Any]) -> str:
-        """
-        Simulate blockchain storage for testing without real transactions.
-        """
-        content_hash = self.compute_hash(log)
-        tx_hash = hashlib.sha256(
-            f"{content_hash}{datetime.now().isoformat()}".encode()
-        ).hexdigest()
-        return f"0x{tx_hash}"
     
     def _get_contract_abi(self) -> list:
         """

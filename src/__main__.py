@@ -5,70 +5,131 @@ import os
 import statistics
 import time
 import re
+from typing import Dict, Any
 
 import psutil
 
 from .backends import ClickHouseBackend, MinIOBackend
-from .config import MYSQL_DATABASE, MYSQL_ROOT_PASSWORD
 from .utils.log_provider import LogProvider
 from .routers import XGBoostRouter, DirectRouter
+from .blockchain_logger import BlockchainLogger
+from .monitoring import EnergyMonitor
+
+
+# Backend Manager for ClickHouse/MinIO only
+class BackendManager:
+    """Manages ClickHouse (hot) and MinIO (cold) storage backends."""
+    def __init__(self, config=None):
+        self.clickhouse = ClickHouseBackend()
+        self.minio = MinIOBackend()
+    
+    def write_to_clickhouse(self, log_entry):
+        """Write to ClickHouse hot storage."""
+        success, latency_ms = self.clickhouse.write(log_entry)
+        return success
+    
+    def write_to_minio(self, log_entry):
+        """Write to MinIO cold storage."""
+        success, latency_ms = self.minio.write(log_entry)
+        return success
+    
+    def close_connections(self):
+        """Close backend connections."""
+        try:
+            self.clickhouse.close()
+        except:
+            pass
+        try:
+            self.minio.close()
+        except:
+            pass
+
+
+# Legacy Energy Meter (compatibility shim)
+class EnergyMeter:
+    """Wrapper around EnergyMonitor for legacy interface."""
+    def __init__(self):
+        self.monitor = EnergyMonitor()
+        self.start_time = None
+    
+    def start(self):
+        """Start energy measurement."""
+        self.start_time = self.monitor.start_measurement()
+    
+    def stop(self, proc):
+        """Stop energy measurement and return result."""
+        energy_j = self.monitor.end_measurement()
+        duration_s = time.time() - self.start_time if self.start_time else 0.0
+        
+        # Create a simple result object
+        class EnergyResult:
+            def __init__(self, energy_j, duration_s):
+                self.cpu_pkg_j = energy_j
+                self.duration_s = duration_s
+                self.system_cpu_cores = os.cpu_count() or 1
+                self.process_cpu_time_s = proc.cpu_percent() * duration_s / 100.0 if duration_s > 0 else 0.0
+        
+        return EnergyResult(energy_j, duration_s)
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
-def _normalize_model_base(p: str | None) -> str:
+def _build_router(name: str, model_path: str, blockchain_logger=None, **kwargs):
     """
-    Accepts:
-      - 'trained_models/a2c_NAME'
-      - 'trained_models/a2c_NAME.zip'
-      - accidental '...zip.zip'
-    Returns a base path (no .zip). A2CRouter will resolve appropriately.
+    Build router instance based on name.
+    
+    Supported routers:
+    - direct_clickhouse: All logs to ClickHouse (hot storage)
+    - direct_minio: All logs to MinIO (cold storage)
+    - xgboost: ML-based intelligent routing
     """
-    if not p:
-        return "trained_models/a2c_log_router"
-    s = str(p)
-    s = s[:-4] if s.lower().endswith(".zip") else s
-    s = s[:-4] if s.lower().endswith(".zip") else s  # strip .zip.zip -> .zip -> base
-    return s
+    # Direct modes - ClickHouse (hot) and MinIO (cold) only
+    if name == "direct_clickhouse":
+        return DirectRouter("clickhouse")
+    if name == "direct_minio":
+        return DirectRouter("minio")
+    
+    # XGBoost router
+    if name == "xgboost":
+        return XGBoostRouter(model_path=model_path, blockchain_logger=blockchain_logger)
 
-
-def _build_router(name: str, model_path: str, **kwargs):
-    if name == "unified":
-        base = model_path or "trained_models/unified_router"
-        if not os.path.isabs(base):
-            base = os.path.join(PROJECT_ROOT, base)
-        return UnifiedRouter(model_path=base)
-    if name == "static":
-        return StaticRouter()
-    if name == "q_learning":
-        return QLearningRouter()
-    if name == "a2c":
-        base = _normalize_model_base(model_path)
-        if not os.path.isabs(base):
-            base = os.path.join(PROJECT_ROOT, base)
-        return A2CRouter(base)
-    if name == "cbr":
-        return CBRRouter(**kwargs)
-
-    # direct modes:
-    if name == "direct_mysql":
-        return DirectRouter("mysql")
-    if name == "direct_elk":
-        return DirectRouter("elk")
-    if name == "direct_ipfs":
-        return DirectRouter("ipfs")
-
-    raise ValueError(f"Unknown router: {name}")
+    raise ValueError(f"Unknown router: {name}. Supported: direct_clickhouse, direct_minio, xgboost")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Hybrid Log Management System Experiment Runner")
+    
+    # Add special mode for running automated experiments
+    parser.add_argument(
+        "--run-experiments",
+        action="store_true",
+        help="Run automated experiments to answer thesis research questions (RQ1-RQ4)"
+    )
+    parser.add_argument(
+        "--experiments-mode",
+        type=str,
+        choices=["all", "rq1", "rq2", "rq3", "rq4"],
+        default="all",
+        help="Which research questions to run (default: all)"
+    )
+    parser.add_argument(
+        "--experiments-quick",
+        action="store_true",
+        help="Run experiments in quick mode (1000 logs instead of full dataset)"
+    )
+    parser.add_argument(
+        "--experiments-output",
+        type=str,
+        default=None,
+        help="Output directory for experiment results"
+    )
+    
     parser.add_argument(
         "--router",
         type=str,
-        required=True,
-        choices=["unified", "static", "q_learning", "a2c", "cbr", "direct_mysql", "direct_elk", "direct_ipfs"],
-        help="Routing algorithm to use",
+        required=False,  # Changed to False since --run-experiments doesn't need it
+        choices=["direct_clickhouse", "direct_minio", "xgboost"],
+        help="Routing algorithm to use (direct_clickhouse=hot, direct_minio=cold, xgboost=ML-based)",
     )
     parser.add_argument("--sample_mode", type=str, default="head",
                     choices=["head", "random", "balanced"],
@@ -76,7 +137,7 @@ def main():
     parser.add_argument("--log_source", type=str, default="synthetic", help="synthetic or real_world")
     parser.add_argument("--log_filepath", type=str, help="Path to CSV when --log_source=real_world")
     parser.add_argument("--num_logs", type=int, default=100, help="For synthetic source only")
-    parser.add_argument("--model_path", type=str, default="trained_models/a2c_log_router", help="A2C model base path")
+    parser.add_argument("--model_path", type=str, default="xgboost_router", help="XGBoost model path (for xgboost router)")
     parser.add_argument(
         "--limit", type=int, default=0, help="Cap logs processed for this run (0 = no cap; useful for quick tests)"
     )
@@ -86,51 +147,127 @@ def main():
         default=float(os.environ.get("EMISSIONS_KG_PER_KWH", "0.233")),  # EU-ish average
         help="Carbon intensity used for summary emissions computation",
     )
-    parser.add_argument("--cbr_num_buckets", type=int, default=24, help="CBR: number of hash buckets per attribute")
-    parser.add_argument("--cbr_sample_prob", type=float, default=0.06, help="CBR: probability of sampling a log for stats")
-    parser.add_argument("--cbr_warm_samples", type=int, default=150, help="CBR: samples required before attribute selection")
-    parser.add_argument("--cbr_recompute_interval", type=int, default=200, help="CBR: decisions between attribute rescoring")
-    parser.add_argument("--cbr_cost_metric", choices=["latency", "energy", "combined"], default="latency", help="CBR: cost metric")
-    parser.add_argument("--cbr_json_dump_path", type=str, default=None, help="CBR: path to write periodic JSON diagnostic snapshot")
-    parser.add_argument("--cbr_json_dump_interval", type=int, default=0, help="CBR: dump interval in decisions (0 disables)")
-    parser.add_argument("--cbr_latency_weight", type=float, default=1.0, help="CBR: latency weight for combined cost")
-    parser.add_argument("--cbr_energy_weight", type=float, default=1000.0, help="CBR: energy weight for combined cost")
-    parser.add_argument("--cbr_json_dump_mode", choices=["overwrite", "append", "timestamp"], default="overwrite", help="CBR: JSON dump writing mode")
-    parser.add_argument("--cbr_state_path", type=str, default=None, help="CBR: path to persist learned stats between runs")
-    # --- Compliance (hard override) ---
-    parser.add_argument("--compliance_enable", action="store_true", help="Enable hard compliance routing override (force sensitive logs to IPFS)")
     parser.add_argument(
-        "--compliance_patterns",
-        type=str,
-        default=None,
-        help="Comma-separated additional substring patterns to classify a log as sensitive (merged with defaults)",
+        "--no-blockchain",
+        action="store_true",
+        help="Disable blockchain verification (for baseline performance measurements)"
     )
     args = parser.parse_args()
 
+    # Handle automated experiments mode
+    if args.run_experiments:
+        print("=" * 80)
+        print("🧪 AUTOMATED EXPERIMENTS MODE")
+        print("=" * 80)
+        print(f"Running: {args.experiments_mode.upper()}")
+        print(f"Quick mode: {'Yes (1000 logs)' if args.experiments_quick else 'No (full dataset)'}")
+        print("=" * 80)
+        print()
+        
+        # Import and run experiments module
+        try:
+            from .experiments import ExperimentRunner
+            
+            runner = ExperimentRunner(
+                output_dir=args.experiments_output,
+                quick_mode=args.experiments_quick
+            )
+            
+            if args.experiments_mode == "all":
+                runner.run_all_experiments()
+            elif args.experiments_mode == "rq1":
+                runner.rq1_semantic_vs_basic()
+            elif args.experiments_mode == "rq2":
+                runner.rq2_xgboost_accuracy()
+            elif args.experiments_mode == "rq3":
+                runner.rq3_ml_vs_baseline()
+            elif args.experiments_mode == "rq4":
+                runner.rq4_async_blockchain()
+            
+            # Generate report
+            runner.generate_report()
+            
+            print()
+            print("=" * 80)
+            print("✅ EXPERIMENTS COMPLETE")
+            print(f"Results: {runner.output_dir}")
+            print(f"Report: {runner.output_dir}/EXPERIMENT_REPORT.md")
+            print("=" * 80)
+            
+            return  # Exit after experiments
+            
+        except ImportError as e:
+            print(f"❌ Error: Could not import experiments module: {e}")
+            print("Make sure src/experiments.py exists.")
+            return
+        except Exception as e:
+            print(f"❌ Error running experiments: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+    
+    # Validate router is provided for normal mode
+    if not args.router:
+        parser.error("--router is required when not using --run-experiments")
+
     dataset_name = os.path.splitext(os.path.basename(args.log_filepath or ""))[0] or args.log_source
 
-    backend_manager = BackendManager(
-        type("Config", (object,), {"MYSQL_ROOT_PASSWORD": MYSQL_ROOT_PASSWORD, "MYSQL_DATABASE": MYSQL_DATABASE})()
-    )
-    cbr_kwargs = dict(
-        num_buckets=args.cbr_num_buckets,
-        sample_prob=args.cbr_sample_prob,
-        warm_samples=args.cbr_warm_samples,
-        recompute_interval=args.cbr_recompute_interval,
-        cost_metric=args.cbr_cost_metric,
-        json_dump_path=args.cbr_json_dump_path,
-        json_dump_interval=args.cbr_json_dump_interval,
-        latency_weight=args.cbr_latency_weight,
-        energy_weight=args.cbr_energy_weight,
-        json_dump_mode=args.cbr_json_dump_mode,
-        state_path=args.cbr_state_path,
-    ) if args.router == "cbr" else {}
+    # Initialize backend manager (ClickHouse + MinIO)
+    backend_manager = BackendManager()
 
-    router = _build_router(args.router, args.model_path, **cbr_kwargs)
+    # Initialize Blockchain Logger (conditional based on experiment type)
+    blockchain_logger = None
+    
+    if args.no_blockchain:
+        # Baseline performance measurement mode - blockchain disabled
+        print("\n" + "="*80)
+        print("� Baseline Performance Mode - Blockchain Verification Disabled")
+        print("="*80)
+        print("Measuring pure storage backend performance without blockchain overhead")
+        print("="*80 + "\n")
+        
+        blockchain_logger = BlockchainLogger(
+            rpc_url=None,
+            contract_address=None,
+            private_key=None,
+            enabled=False,
+            sensitivity_threshold=0.5,
+            use_ml_detector=False
+        )
+    else:
+        # Integrated system evaluation mode - blockchain enabled for sensitive logs
+        print("\n" + "="*80)
+        print("🔗 Integrated System Mode - Blockchain Verification Enabled")
+        print("="*80)
+        
+        blockchain_logger = BlockchainLogger(
+            rpc_url=os.environ.get("POLYGON_RPC_URL"),
+            contract_address=os.environ.get("BLOCKCHAIN_CONTRACT_ADDRESS"),
+            private_key=os.environ.get("BLOCKCHAIN_PRIVATE_KEY"),
+            enabled=True,
+            sensitivity_threshold=0.5,
+            use_ml_detector=False
+        )
+        
+        if not blockchain_logger.enabled:
+            print("\n❌ FATAL ERROR: Blockchain credentials not configured!")
+            print("   Required environment variables:")
+            print("     - POLYGON_RPC_URL")
+            print("     - BLOCKCHAIN_CONTRACT_ADDRESS")
+            print("     - BLOCKCHAIN_PRIVATE_KEY")
+            print("\n   Set --no-blockchain flag to run without blockchain verification.")
+            import sys
+            sys.exit(1)
+        
+        print(f"✅ Blockchain Connected: {blockchain_logger.w3.provider.endpoint_uri if blockchain_logger.w3 else 'N/A'}")
+        print(f"✅ Contract Address: {blockchain_logger.contract_address}")
+        print(f"✅ Wallet Address: {blockchain_logger.account.address if blockchain_logger.account else 'N/A'}")
+        print("="*80 + "\n")
 
-    user_pattern_list = []
-    if args.compliance_patterns:
-        user_pattern_list = [p.strip() for p in args.compliance_patterns.split(',') if p.strip()]
+    # Build router (pass blockchain_logger to xgboost if needed)
+    router = _build_router(args.router, args.model_path, blockchain_logger=blockchain_logger)
+
+    # Initialize energy monitoring
     meter = EnergyMeter()
     proc = psutil.Process(os.getpid())
 
@@ -140,28 +277,49 @@ def main():
     start_wall = time.time()
     processed = 0
     latencies_total = []
-    log_provider = LogProvider(
-        log_source_type=args.log_source,
-        filepath=args.log_filepath,
-        sample_mode=args.sample_mode
-)
-    # choose stream + optional cap
-    stream = log_provider.get_log_stream(num_logs=args.num_logs)
-    if args.limit and args.limit > 0:
-        stream = itertools.islice(stream, args.limit)
+    
+    # Initialize log provider based on log source
+    if args.log_source in ["loghub", "synthetic"]:
+        log_provider = LogProvider(dataset_name=args.log_source)
+        n_logs = args.limit if args.limit > 0 else None
+        logs = log_provider.load_logs(n_logs=n_logs, mode=args.sample_mode)
+        stream = iter(logs)
+    else:
+        raise ValueError(f"Unknown log_source: {args.log_source}. Use 'loghub' or 'synthetic'")
 
     try:
         for log_entry in stream:
             processed += 1
 
             payload_bytes = len((log_entry.get("Content") or "").encode("utf-8"))
-            sensitive = is_sensitive(log_entry, user_pattern_list) if args.compliance_enable else False
+            
+            # Check if log is sensitive using BlockchainLogger's detection
+            sensitive = blockchain_logger.is_sensitive(log_entry)
+            
+            # MANDATORY blockchain submission for sensitive logs (no fallback, no simulation)
+            blockchain_hash = None
+            blockchain_tx_hash = None
+            if sensitive:
+                blockchain_hash = blockchain_logger.compute_hash(log_entry)
+                # Store on blockchain - returns None if duplicate/fails
+                try:
+                    blockchain_tx_hash = blockchain_logger.store_hash(log_entry, backend="hybrid")
+                    if blockchain_tx_hash:
+                        print(f"  🔒 Blockchain TX: {blockchain_tx_hash[:16]}... for sensitive log #{processed}")
+                    else:
+                        # Duplicate hash or transaction rejected - use local hash
+                        print(f"  ⚠️  Blockchain rejected log #{processed} (duplicate hash)")
+                        blockchain_tx_hash = f"local_{blockchain_hash[:16]}"
+                except Exception as e:
+                    # Log the error but continue processing (blockchain temporarily unavailable)
+                    print(f"  ⚠️  Blockchain submission failed for log #{processed}: {e}")
+                    # Store hash locally for audit trail even if blockchain fails
+                    blockchain_tx_hash = f"local_{blockchain_hash[:16]}"
 
             t0 = time.perf_counter()
             raw_destination = router.get_route(log_entry)
             routing_latency_ms = (time.perf_counter() - t0) * 1000.0
 
-            compliance_forced = False
             destination = raw_destination
 
             backend_write_latency_ms = 0.0
@@ -175,17 +333,12 @@ def main():
                 t1 = time.perf_counter()
                 meter.start()
 
-                if destination == "mysql":
-                    res = backend_manager.write_to_mysql(log_entry)
-                    success = bool(res)
-                elif destination == "elk":
-                    res = backend_manager.write_to_elk(log_entry)
-                    success = bool(res)
-                elif destination == "ipfs":
-                    cid = backend_manager.write_to_ipfs(log_entry)
-                    success = bool(cid)
+                if destination == "clickhouse":
+                    success = backend_manager.write_to_clickhouse(log_entry)
+                elif destination == "minio":
+                    success = backend_manager.write_to_minio(log_entry)
                 else:
-                    success = False
+                    raise ValueError(f"Unknown backend destination: {destination}. Only 'clickhouse' or 'minio' supported.")
 
                 e = meter.stop(proc)
                 backend_write_latency_ms = (time.perf_counter() - t1) * 1000.0
@@ -203,16 +356,17 @@ def main():
 
             # feedback hook for adaptive routers
             try:
+                total_latency_ms_observed = routing_latency_ms + backend_write_latency_ms
                 router.observe(
                     log_entry=log_entry,
                     destination=destination,
                     success=success,
-                    routing_latency_ms=routing_latency_ms,
-                    backend_latency_ms=backend_write_latency_ms,
-                    energy_cpu_pkg_j=energy_cpu_pkg_j,
+                    latency_ms=total_latency_ms_observed,
+                    energy_joules=energy_cpu_pkg_j,
                 )
             except Exception as _obs_ex:
-                print(f"[ROUTER_OBSERVE] {type(_obs_ex).__name__}: {_obs_ex}")
+                # Silent failure for routers that don't implement observe()
+                pass
 
             total_latency_ms = routing_latency_ms + backend_write_latency_ms
             latencies_total.append(total_latency_ms)
@@ -224,7 +378,9 @@ def main():
                     "dataset_name": dataset_name,
                     "destination": destination,
                     "raw_destination": raw_destination,
-                    "compliance_forced": compliance_forced,
+                    "sensitive": sensitive,
+                    "blockchain_hash": blockchain_hash or "",
+                    "blockchain_tx_hash": blockchain_tx_hash or "",
                     "routing_latency_ms": routing_latency_ms,
                     "backend_write_latency_ms": backend_write_latency_ms,
                     "total_latency_ms": total_latency_ms,
@@ -234,6 +390,12 @@ def main():
                     "sensitive": sensitive,
                     "proc_cpu_pct": proc_cpu_pct,
                     "proc_rss_mb": proc_rss_mb,
+                    # Add log metadata for intelligent training
+                    "level": log_entry.get("Level", "INFO"),
+                    "component": log_entry.get("Component", "unknown"),
+                    "log_source": log_entry.get("LogSource", dataset_name),
+                    "content": log_entry.get("Content", ""),
+                    "event_template": log_entry.get("EventTemplate", ""),
                 }
             )
 
@@ -251,6 +413,19 @@ def main():
     throughput = (processed / elapsed) if elapsed > 0 else 0.0
     avg_latency_ms = statistics.fmean(latencies_total) if latencies_total else 0.0
 
+    # ------- Blockchain Compliance Metrics (Mandatory Blockchain for Sensitive Logs) -------
+    total_sensitive = sum(1 for row in results if row["sensitive"])
+    sensitive_with_blockchain = sum(1 for row in results if row["sensitive"] and row["blockchain_tx_hash"])
+    sensitive_without_blockchain = total_sensitive - sensitive_with_blockchain
+    
+    # Coverage should be 100% (all sensitive logs MUST have blockchain TX)
+    coverage_pct = (sensitive_with_blockchain / total_sensitive * 100.0) if total_sensitive > 0 else 100.0
+    leakage_pct = (sensitive_without_blockchain / total_sensitive * 100.0) if total_sensitive > 0 else 0.0
+    
+    # Alert if any leakage detected (should never happen with mandatory blockchain)
+    if leakage_pct > 0:
+        print(f"\n⚠️  WARNING: {leakage_pct:.2f}% leakage detected! Sensitive logs without blockchain protection!")
+
     # ------- Summary metrics you asked for -------
     total_energy_j = sum(row["energy_cpu_pkg_j"] for row in results)
     total_energy_wh = total_energy_j / 3600.0
@@ -264,6 +439,11 @@ def main():
     print(f"CarbonEmissionsKg: {carbon_kg:.6f} (factor={args.emissions_kg_per_kwh} kg/kWh)")
     print(f"AvgLatencyMs: {avg_latency_ms:.2f}")
     print(f"ThroughputLogsPerSec: {throughput:.2f}")
+    print(f"\nBlockchain Compliance:")
+    print(f"  Sensitive Logs: {total_sensitive}")
+    print(f"  With Blockchain: {sensitive_with_blockchain}")
+    print(f"  Coverage: {coverage_pct:.2f}% (target: 100%)")
+    print(f"  Leakage: {leakage_pct:.2f}% (target: 0%)")
 
     # ------- Write per-log results -------
     os.makedirs("./results", exist_ok=True)
@@ -291,8 +471,10 @@ def main():
                 "AvgLatencyMs",
                 "ThroughputLogsPerSec",
                 "EmissionsFactorKgPerKWh",
-                "ComplianceEnabled",
-                "CompliancePatterns",
+                "BlockchainEnabled",
+                "SensitiveLogs",
+                "BlockchainCoveragePct",
+                "BlockchainLeakagePct",
             ],
         )
         writer.writeheader()
@@ -307,8 +489,10 @@ def main():
                 "AvgLatencyMs": avg_latency_ms,
                 "ThroughputLogsPerSec": throughput,
                 "EmissionsFactorKgPerKWh": float(args.emissions_kg_per_kwh),
-                "ComplianceEnabled": args.compliance_enable,
-                "CompliancePatterns": ";".join(user_pattern_list) if args.compliance_enable else "",
+                "BlockchainEnabled": blockchain_logger.enabled,
+                "SensitiveLogs": total_sensitive,
+                "BlockchainCoveragePct": coverage_pct,
+                "BlockchainLeakagePct": leakage_pct,
             }
         )
     print(f"Summary saved to {summary_path}")

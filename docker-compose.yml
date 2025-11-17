@@ -8,6 +8,15 @@ services:
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=
       - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+
+      # ⚠️ MANDATORY: Real Polygon Layer 2 Blockchain Credentials Required
+      # Get RPC URL from: https://www.alchemy.com/polygon or https://infura.io/
+      # Deploy smart contract to Polygon and set contract address
+      # Export your Ethereum wallet private key (keep secure!)
+      - POLYGON_RPC_URL=${POLYGON_RPC_URL:-REPLACE_WITH_REAL_RPC_URL}
+      - BLOCKCHAIN_ENABLED=true
+      - BLOCKCHAIN_CONTRACT_ADDRESS=${BLOCKCHAIN_CONTRACT_ADDRESS:-REPLACE_WITH_DEPLOYED_CONTRACT}
+      - BLOCKCHAIN_PRIVATE_KEY=${BLOCKCHAIN_PRIVATE_KEY:-REPLACE_WITH_WALLET_PRIVATE_KEY}
     ports:
       - "8123:8123" # HTTP interface
       - "9000:9000" # Native interface

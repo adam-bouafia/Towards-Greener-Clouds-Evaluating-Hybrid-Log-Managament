@@ -22,5 +22,10 @@ tqdm>=4.66.0
 transformers>=4.30.0  # For DistilBERT semantic embeddings
 torch>=2.0.0          # Deep learning backend for transformers
 
+# Blockchain Integration - Required for Polygon Layer 2 audit trail
+web3>=6.0.0           # Ethereum/Polygon blockchain interaction
+eth-account>=0.9.0    # Ethereum account management and signing
+hexbytes>=0.3.0       # Hex-encoded byte string utilities
+
 # Note: For CPU-only (lighter install):
 # pip install torch --index-url https://download.pytorch.org/whl/cpu

@@ -155,7 +155,7 @@ class XGBoostRouter(BaseRouter):
         
         if self.blockchain_logger and self.blockchain_logger.enabled:
             if self.blockchain_logger.is_sensitive(log_entry):
-                tx_hash = self.blockchain_logger.store_hash(log_entry)
+                tx_hash = self.blockchain_logger.store_hash(log_entry, backend="hybrid")
                 if tx_hash:
                     log_entry['blockchain_hash'] = tx_hash
                     self.blockchain_count += 1

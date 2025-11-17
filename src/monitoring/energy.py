@@ -31,12 +31,19 @@ class EnergyMonitor:
         if self.available:
             # Find package-0 (main CPU package)
             for item in self.RAPL_PATH.iterdir():
-                if item.is_dir() and "package-0" in item.name:
-                    self.package_path = item / "energy_uj"
-                    break
+                if item.is_dir() and item.name.startswith("intel-rapl:"):
+                    name_file = item / "name"
+                    if name_file.exists():
+                        try:
+                            with open(name_file, "r") as f:
+                                if "package-0" in f.read():
+                                    self.package_path = item / "energy_uj"
+                                    break
+                        except (IOError, ValueError):
+                            continue
         
         if self.available and self.package_path:
-            print(f"✅ EnergyMonitor initialized (RAPL available)")
+            print(f"✅ EnergyMonitor initialized (RAPL available at {self.package_path})")
         else:
             print(f"⚠️  EnergyMonitor initialized (RAPL not available, will return 0)")
     
