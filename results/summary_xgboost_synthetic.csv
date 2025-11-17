@@ -1,0 +1,2 @@
+router,dataset_name,LogsProcessed,TotalEnergyWh,EnergyPerLogWh,CarbonEmissionsKg,AvgLatencyMs,ThroughputLogsPerSec,EmissionsFactorKgPerKWh,BlockchainEnabled,SensitiveLogs,BlockchainCoveragePct,BlockchainLeakagePct
+xgboost,synthetic,200000,2.6763026775491667,1.3381513387745833e-05,0.6235785238689558,8.607457946822578,113.45210368741327,0.233,True,54,100.0,0.0

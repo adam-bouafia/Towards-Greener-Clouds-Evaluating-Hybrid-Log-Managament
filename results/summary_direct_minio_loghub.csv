@@ -1,0 +1,2 @@
+router,dataset_name,LogsProcessed,TotalEnergyWh,EnergyPerLogWh,CarbonEmissionsKg,AvgLatencyMs,ThroughputLogsPerSec,EmissionsFactorKgPerKWh,BlockchainEnabled,SensitiveLogs,BlockchainCoveragePct,BlockchainLeakagePct
+direct_minio,loghub,14000,7.544438795138889e-05,5.388884853670635e-09,1.757854239267361e-05,0.11154774502314727,5443.349825845083,0.233,False,0,100.0,0.0

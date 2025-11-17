@@ -1,0 +1,2 @@
+router,dataset_name,LogsProcessed,TotalEnergyWh,EnergyPerLogWh,CarbonEmissionsKg,AvgLatencyMs,ThroughputLogsPerSec,EmissionsFactorKgPerKWh,BlockchainEnabled,SensitiveLogs,BlockchainCoveragePct,BlockchainLeakagePct
+direct_clickhouse,synthetic,200000,0.20886242244225695,1.0443121122112847e-06,0.04866494442904587,9.020956442681745,109.49546138619223,0.233,False,0,100.0,0.0
