@@ -42,8 +42,8 @@ This system uses **machine learning with semantic understanding** to intelligent
                                        │ (async, non-blocking)
                                        ▼
                     ┌──────────────────────────────────────┐
-                    │  BlockchainLogger (Optional)         │
-                    │  - Polygon blockchain verification   │
+                    │  BlockchainLogger                    │
+                    │  - Blockchain verification           │
                     │  - Only for sensitive logs           │
                     │  - Runs asynchronously               │
                     └──────────────────────────────────────┘
@@ -51,12 +51,12 @@ This system uses **machine learning with semantic understanding** to intelligent
 
 ## 🔬 How It Works
 
-## 🔗 Blockchain Integration (Optional)
+## 🔗 Blockchain Integration
 
-We support optional, asynchronous blockchain verification for sensitive logs. The default setup for development uses a local Ganache instance; this provides deterministic accounts and instant blocks so experiments are reproducible and cheap.
+Asynchronous blockchain verification for sensitive logs is a core component of the system. The default setup for development uses a local Ganache instance; this provides deterministic accounts and instant blocks so experiments are reproducible and cheap.
 
 - Local (recommended for experiments): Ganache on port 8545
-- Production/Testnet: Any Polygon-compatible RPC (set via `POLYGON_RPC_URL`)
+- Production/Testnet: Any EVM-compatible RPC (set via `POLYGON_RPC_URL`)
 
 Important notes:
 - Do NOT store private keys in repository files. `run_all_experiments.sh` now reads `BLOCKCHAIN_PRIVATE_KEY` from the environment.
