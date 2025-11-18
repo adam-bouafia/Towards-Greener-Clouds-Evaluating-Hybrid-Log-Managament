@@ -198,62 +198,6 @@ python -m src --run-experiments --experiments-mode rq4
 python -m src --run-experiments --experiments-output results/my_experiment
 ```
 
-**What it does**:
-- Automatically trains all models (basic, semantic, baselines)
-- Runs experiments for all 4 research questions
-- Collects metrics (accuracy, cost, energy, latency)
-- Generates comprehensive reports in markdown and JSON
-- Creates thesis-ready comparison tables
-
-**Output**: `results/experiments_YYYYMMDD_HHMMSS/EXPERIMENT_REPORT.md`
-
-For detailed documentation, see **[EXPERIMENTS_README.md](EXPERIMENTS_README.md)**
-
-### Research Questions Addressed
-
-**RQ1: Basic vs. Semantic Features**
-- Compares 6 basic statistical features vs. 778 semantic features
-- Expected: +22.4% accuracy improvement (72% → 95%)
-
-**RQ2: XGBoost Routing Accuracy**
-- Analyzes routing distribution (25% hot, 75% cold)
-- Expected: >90% accuracy, 67.5% cost savings
-
-**RQ3: ML vs. Baseline Comparison**
-- Tests: Direct storage, Rule-based, CBR, XGBoost
-- Expected: XGBoost best (95% accuracy)
-
-**RQ4: Async Blockchain Performance**
-- Measures blockchain overhead
-- Expected: <1ms overhead, maintains <10ms latency
-
-### Manual Evaluation
-
-#### Baseline Comparisons
-
-1. **Direct ClickHouse** - All logs to hot storage
-2. **Direct MinIO** - All logs to cold storage
-3. **Rule-based Router** - Static rules
-4. **CBR Router** - Case-based reasoning
-5. **Semantic XGBoost** - Semantic features (778-dim) ← **Our approach**
-
-#### Metrics Evaluated
-
-- **Accuracy**: Routing correctness vs ground truth
-- **Latency**: Time per routing decision (target: <10ms)
-- **Energy**: Power consumption (RAPL measurements)
-- **Cost**: Storage and compute costs
-
-#### Expected Results
-
-| Router | Accuracy | Latency | Energy | Cost |
-|--------|----------|---------|--------|------|
-| Direct CH | ~50% | 0.1ms | High | High |
-| Direct MinIO | ~50% | 0.1ms | Low | High |
-| Rule-based | ~72% | 0.5ms | Low | Medium |
-| CBR | ~76% | 2-3ms | Medium | Medium |
-| **Semantic XGB** | **~95%** | **5-8ms** | **Medium** | **Low** |
-
 ## 🔥 Key Features
 
 ### 1. Semantic Understanding with DistilBERT
@@ -336,8 +280,3 @@ BLOCKCHAIN_SIMULATION_MODE = True  # Simulation mode for testing
 ## 📝 License
 
 Academic research project - see institution guidelines.
-
----
-
-**Status**: Week 1 Implementation (Feature Engineering) - In Progress
-**Next Steps**: Train semantic model, evaluate on real logs, measure energy consumption
